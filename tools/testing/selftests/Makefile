@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0
 TARGETS += alsa
 TARGETS += arm64
+TARGETS += binder
 TARGETS += bpf
 TARGETS += breakpoints
 TARGETS += capabilities

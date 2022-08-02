@@ -58,6 +58,39 @@ impl From<AllocError> for BinderError {
     }
 }
 
+/// Keeps track of how much unused buffer space is left. The initial amount is the number of bytes
+/// requested by the user using the `buffers_size` field of `binder_transaction_data_sg`. Each time
+/// we translate an object of type `BINDER_TYPE_PTR`, some of the unused buffer space is consumed.
+struct UnusedBufferSpace {
+    /// The start of the remaining space.
+    offset: usize,
+    /// The end of the remaining space.
+    limit: usize,
+}
+
+impl UnusedBufferSpace {
+    /// Claim the next `size` bytes from the unused buffer space. The offset for the claimed chunk
+    /// into the buffer is returned.
+    fn claim_next(&mut self, size: usize) -> Result<usize> {
+        // We require every chunk to be aligned.
+        let mut size = ptr_align(size);
+        if size == 0 {
+            // Ensure that each buffer has a unique address.
+            size = size_of::<usize>();
+        }
+
+        let new_offset = self.offset.checked_add(size).ok_or(EINVAL)?;
+
+        if new_offset <= self.limit {
+            let offset = self.offset;
+            self.offset = new_offset;
+            Ok(offset)
+        } else {
+            Err(EINVAL)
+        }
+    }
+}
+
 const LOOPER_REGISTERED: u32 = 0x01;
 const LOOPER_ENTERED: u32 = 0x02;
 const LOOPER_EXITED: u32 = 0x04;
@@ -382,6 +415,7 @@ impl Thread {
         index_offset: usize,
         view: &mut AllocationView<'_, '_>,
         allow_fds: bool,
+        unused_buffer_space: &mut UnusedBufferSpace,
     ) -> BinderResult {
         let offset = view.alloc.read(index_offset)?;
         let header = view.read::<bindings::binder_object_header>(offset)?;
@@ -435,6 +469,28 @@ impl Thread {
                 let file_info = Box::try_new(FileInfo::new(file, offset + field_offset))?;
                 view.alloc.add_file_info(file_info);
             }
+            BINDER_TYPE_PTR => {
+                let obj = view.read::<bindings::binder_buffer_object>(offset)?;
+
+                if obj.flags & bindings::BINDER_BUFFER_FLAG_HAS_PARENT != 0 {
+                    // TODO: support BINDER_BUFFER_FLAG_HAS_PARENT
+                    return Err(BinderError::new_failed());
+                }
+
+                let obj_length = obj.length.try_into().map_err(|_| EINVAL)?;
+                let alloc_offset = unused_buffer_space.claim_next(obj_length)?;
+
+                // Copy extra buffer from user-space.
+                let mut reader = unsafe { UserSlicePtr::new(obj.buffer as _, obj_length) }.reader();
+                view.alloc
+                    .copy_into(&mut reader, alloc_offset, obj_length)?;
+
+                // Update pointer in `binder_buffer_object`.
+                let offset_to_buffer_field =
+                    kernel::offset_of!(bindings::binder_buffer_object, buffer) as usize;
+                let buffer_ptr_in_user_space = view.alloc.ptr + alloc_offset;
+                view.write::<usize>(offset + offset_to_buffer_field, &buffer_ptr_in_user_space)?;
+            }
             _ => pr_warn!("Unsupported binder object type: {:x}\n", header.type_),
         }
         Ok(())
@@ -446,10 +502,11 @@ impl Thread {
         start: usize,
         end: usize,
         allow_fds: bool,
+        unused_buffer_space: &mut UnusedBufferSpace,
     ) -> BinderResult {
         let mut view = AllocationView::new(alloc, start);
         for i in (start..end).step_by(size_of::<usize>()) {
-            if let Err(err) = self.translate_object(i, &mut view, allow_fds) {
+            if let Err(err) = self.translate_object(i, &mut view, allow_fds, unused_buffer_space) {
                 alloc.set_info(AllocationInfo { offsets: start..i });
                 return Err(err);
             }
@@ -463,30 +520,43 @@ impl Thread {
     pub(crate) fn copy_transaction_data<'a>(
         &self,
         to_process: &'a Process,
-        tr: &BinderTransactionData,
+        tr: &BinderTransactionDataSg,
         allow_fds: bool,
     ) -> BinderResult<Allocation<'a>> {
-        let data_size = tr.data_size as _;
+        let trd = &tr.transaction_data;
+
+        let data_size = trd.data_size.try_into().map_err(|_| EINVAL)?;
         let adata_size = ptr_align(data_size);
-        let offsets_size = tr.offsets_size as _;
+        let offsets_size = trd.offsets_size.try_into().map_err(|_| EINVAL)?;
         let aoffsets_size = ptr_align(offsets_size);
+        let buffers_size = tr.buffers_size.try_into().map_err(|_| EINVAL)?;
+        let abuffers_size = ptr_align(buffers_size);
 
         // This guarantees that at least `sizeof(usize)` bytes will be allocated.
         let len = core::cmp::max(
-            adata_size.checked_add(aoffsets_size).ok_or(ENOMEM)?,
+            adata_size
+                .checked_add(aoffsets_size)
+                .and_then(|sum| sum.checked_add(abuffers_size))
+                .ok_or(ENOMEM)?,
             size_of::<usize>(),
         );
         let mut alloc = to_process.buffer_alloc(len)?;
 
         // Copy raw data.
-        let mut reader = unsafe { UserSlicePtr::new(tr.data.ptr.buffer as _, data_size) }.reader();
+        let mut reader = unsafe { UserSlicePtr::new(trd.data.ptr.buffer as _, data_size) }.reader();
         alloc.copy_into(&mut reader, 0, data_size)?;
 
         // Copy offsets if there are any.
         if offsets_size > 0 {
             let mut reader =
-                unsafe { UserSlicePtr::new(tr.data.ptr.offsets as _, offsets_size) }.reader();
+                unsafe { UserSlicePtr::new(trd.data.ptr.offsets as _, offsets_size) }.reader();
             alloc.copy_into(&mut reader, adata_size, offsets_size)?;
+
+            // Buffer space for `BINDER_TYPE_PTR` objects.
+            let mut unused_buffer_space = UnusedBufferSpace {
+                offset: adata_size + aoffsets_size,
+                limit: len,
+            };
 
             // Traverse the objects specified.
             self.translate_objects(
@@ -494,6 +564,7 @@ impl Thread {
                 adata_size,
                 adata_size + aoffsets_size,
                 allow_fds,
+                &mut unused_buffer_space,
             )?;
         }
 
@@ -565,16 +636,16 @@ impl Thread {
         }
     }
 
-    fn transaction<T>(self: &Ref<Self>, tr: &BinderTransactionData, inner: T)
+    fn transaction<T>(self: &Ref<Self>, tr: &BinderTransactionDataSg, inner: T)
     where
-        T: FnOnce(&Ref<Self>, &BinderTransactionData) -> BinderResult,
+        T: FnOnce(&Ref<Self>, &BinderTransactionDataSg) -> BinderResult,
     {
         if let Err(err) = inner(self, tr) {
             self.inner.lock().push_return_work(err.reply);
         }
     }
 
-    fn reply_inner(self: &Ref<Self>, tr: &BinderTransactionData) -> BinderResult {
+    fn reply_inner(self: &Ref<Self>, tr: &BinderTransactionDataSg) -> BinderResult {
         let orig = self.inner.lock().pop_transaction_to_reply(self)?;
         if !orig.from.is_current_transaction(&orig) {
             return Err(BinderError::new_failed());
@@ -615,8 +686,8 @@ impl Thread {
         })
     }
 
-    fn oneway_transaction_inner(self: &Ref<Self>, tr: &BinderTransactionData) -> BinderResult {
-        let handle = unsafe { tr.target.handle };
+    fn oneway_transaction_inner(self: &Ref<Self>, tr: &BinderTransactionDataSg) -> BinderResult {
+        let handle = unsafe { tr.transaction_data.target.handle };
         let node_ref = self.process.get_transaction_node(handle)?;
         security::binder_transaction(&self.process.cred, &node_ref.node.owner.cred)?;
         let completion = Ref::try_new(DeliverCode::new(BR_TRANSACTION_COMPLETE))?;
@@ -627,8 +698,8 @@ impl Thread {
         Ok(())
     }
 
-    fn transaction_inner(self: &Ref<Self>, tr: &BinderTransactionData) -> BinderResult {
-        let handle = unsafe { tr.target.handle };
+    fn transaction_inner(self: &Ref<Self>, tr: &BinderTransactionDataSg) -> BinderResult {
+        let handle = unsafe { tr.transaction_data.target.handle };
         let node_ref = self.process.get_transaction_node(handle)?;
         security::binder_transaction(&self.process.cred, &node_ref.node.owner.cred)?;
         // TODO: We need to ensure that there isn't a pending transaction in the work queue. How
@@ -664,14 +735,29 @@ impl Thread {
             let before = reader.len();
             match reader.read::<u32>()? {
                 BC_TRANSACTION => {
-                    let tr = reader.read::<BinderTransactionData>()?;
-                    if tr.flags & TF_ONE_WAY != 0 {
+                    let tr = reader.read::<BinderTransactionData>()?.with_buffers_size(0);
+                    if tr.transaction_data.flags & TF_ONE_WAY != 0 {
                         self.transaction(&tr, Self::oneway_transaction_inner)
                     } else {
                         self.transaction(&tr, Self::transaction_inner)
                     }
                 }
-                BC_REPLY => self.transaction(&reader.read()?, Self::reply_inner),
+                BC_TRANSACTION_SG => {
+                    let tr = reader.read::<BinderTransactionDataSg>()?;
+                    if tr.transaction_data.flags & TF_ONE_WAY != 0 {
+                        self.transaction(&tr, Self::oneway_transaction_inner)
+                    } else {
+                        self.transaction(&tr, Self::transaction_inner)
+                    }
+                }
+                BC_REPLY => {
+                    let tr = reader.read::<BinderTransactionData>()?.with_buffers_size(0);
+                    self.transaction(&tr, Self::reply_inner)
+                }
+                BC_REPLY_SG => {
+                    let tr = reader.read::<BinderTransactionDataSg>()?;
+                    self.transaction(&tr, Self::reply_inner)
+                }
                 BC_FREE_BUFFER => drop(self.process.buffer_get(reader.read()?)),
                 BC_INCREFS => self.process.update_ref(reader.read()?, true, false)?,
                 BC_ACQUIRE => self.process.update_ref(reader.read()?, true, true)?,
@@ -689,7 +775,6 @@ impl Thread {
                 BC_ENTER_LOOPER => self.inner.lock().looper_enter(),
                 BC_EXIT_LOOPER => self.inner.lock().looper_exit(),
 
-                // TODO: Add support for BC_TRANSACTION_SG and BC_REPLY_SG.
                 // BC_ATTEMPT_ACQUIRE and BC_ACQUIRE_RESULT are no longer supported.
                 _ => return Err(EINVAL),
             }

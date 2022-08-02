@@ -35,7 +35,9 @@ pub_no_prefix!(
 pub_no_prefix!(
     binder_driver_command_protocol_,
     BC_TRANSACTION,
+    BC_TRANSACTION_SG,
     BC_REPLY,
+    BC_REPLY_SG,
     BC_FREE_BUFFER,
     BC_INCREFS,
     BC_ACQUIRE,
@@ -54,13 +56,14 @@ pub_no_prefix!(
 pub_no_prefix!(transaction_flags_, TF_ONE_WAY, TF_ACCEPT_FDS);
 
 pub(crate) use bindings::{
-    BINDER_TYPE_BINDER, BINDER_TYPE_FD, BINDER_TYPE_HANDLE, BINDER_TYPE_WEAK_BINDER,
-    BINDER_TYPE_WEAK_HANDLE, FLAT_BINDER_FLAG_ACCEPTS_FDS,
+    BINDER_TYPE_BINDER, BINDER_TYPE_FD, BINDER_TYPE_HANDLE, BINDER_TYPE_PTR,
+    BINDER_TYPE_WEAK_BINDER, BINDER_TYPE_WEAK_HANDLE, FLAT_BINDER_FLAG_ACCEPTS_FDS,
 };
 
 macro_rules! decl_wrapper {
     ($newname:ident, $wrapped:ty) => {
         #[derive(Copy, Clone, Default)]
+        #[repr(transparent)]
         pub(crate) struct $newname($wrapped);
 
         // TODO: This must be justified by inspecting the type, so should live outside the macro or
@@ -87,6 +90,10 @@ decl_wrapper!(BinderNodeDebugInfo, bindings::binder_node_debug_info);
 decl_wrapper!(BinderNodeInfoForRef, bindings::binder_node_info_for_ref);
 decl_wrapper!(FlatBinderObject, bindings::flat_binder_object);
 decl_wrapper!(BinderTransactionData, bindings::binder_transaction_data);
+decl_wrapper!(
+    BinderTransactionDataSg,
+    bindings::binder_transaction_data_sg
+);
 decl_wrapper!(BinderWriteRead, bindings::binder_write_read);
 decl_wrapper!(BinderVersion, bindings::binder_version);
 
@@ -94,6 +101,15 @@ impl BinderVersion {
     pub(crate) fn current() -> Self {
         Self(bindings::binder_version {
             protocol_version: bindings::BINDER_CURRENT_PROTOCOL_VERSION as _,
+        })
+    }
+}
+
+impl BinderTransactionData {
+    pub(crate) fn with_buffers_size(self, buffers_size: u64) -> BinderTransactionDataSg {
+        BinderTransactionDataSg(bindings::binder_transaction_data_sg {
+            transaction_data: self.0,
+            buffers_size,
         })
     }
 }

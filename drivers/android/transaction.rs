@@ -47,8 +47,9 @@ impl Transaction {
         node_ref: NodeRef,
         stack_next: Option<Ref<Transaction>>,
         from: &Ref<Thread>,
-        tr: &BinderTransactionData,
+        tr: &BinderTransactionDataSg,
     ) -> BinderResult<Ref<Self>> {
+        let trd = &tr.transaction_data;
         let allow_fds = node_ref.node.flags & FLAT_BINDER_FLAG_ACCEPTS_FDS != 0;
         let to = node_ref.node.owner.clone();
         let mut alloc = from.copy_transaction_data(&to, tr, allow_fds)?;
@@ -62,11 +63,11 @@ impl Transaction {
             stack_next,
             from: from.clone(),
             to,
-            code: tr.code,
-            flags: tr.flags,
-            data_size: tr.data_size as _,
+            code: trd.code,
+            flags: trd.flags,
+            data_size: trd.data_size as _,
             data_address,
-            offsets_size: tr.offsets_size as _,
+            offsets_size: trd.offsets_size as _,
             links: Links::new(),
             free_allocation: AtomicBool::new(true),
         })?);
@@ -81,9 +82,10 @@ impl Transaction {
     pub(crate) fn new_reply(
         from: &Ref<Thread>,
         to: Ref<Process>,
-        tr: &BinderTransactionData,
+        tr: &BinderTransactionDataSg,
         allow_fds: bool,
     ) -> BinderResult<Ref<Self>> {
+        let trd = &tr.transaction_data;
         let mut alloc = from.copy_transaction_data(&to, tr, allow_fds)?;
         let data_address = alloc.ptr;
         let file_list = alloc.take_file_list();
@@ -95,11 +97,11 @@ impl Transaction {
             stack_next: None,
             from: from.clone(),
             to,
-            code: tr.code,
-            flags: tr.flags,
-            data_size: tr.data_size as _,
+            code: trd.code,
+            flags: trd.flags,
+            data_size: trd.data_size as _,
             data_address,
-            offsets_size: tr.offsets_size as _,
+            offsets_size: trd.offsets_size as _,
             links: Links::new(),
             free_allocation: AtomicBool::new(true),
         })?);

@@ -415,6 +415,7 @@ impl Thread {
         index_offset: usize,
         view: &mut AllocationView<'_, '_>,
         allow_fds: bool,
+        offsets_start: usize,
         unused_buffer_space: &mut UnusedBufferSpace,
     ) -> BinderResult {
         let offset = view.alloc.read(index_offset)?;
@@ -472,24 +473,64 @@ impl Thread {
             BINDER_TYPE_PTR => {
                 let obj = view.read::<bindings::binder_buffer_object>(offset)?;
 
-                if obj.flags & bindings::BINDER_BUFFER_FLAG_HAS_PARENT != 0 {
-                    // TODO: support BINDER_BUFFER_FLAG_HAS_PARENT
-                    return Err(BinderError::new_failed());
-                }
-
                 let obj_length = obj.length.try_into().map_err(|_| EINVAL)?;
                 let alloc_offset = unused_buffer_space.claim_next(obj_length)?;
+
+                let offset_to_buffer_field =
+                    kernel::offset_of!(bindings::binder_buffer_object, buffer) as usize;
+                let buffer_ptr_in_user_space = view.alloc.ptr + alloc_offset;
 
                 // Copy extra buffer from user-space.
                 let mut reader = unsafe { UserSlicePtr::new(obj.buffer as _, obj_length) }.reader();
                 view.alloc
                     .copy_into(&mut reader, alloc_offset, obj_length)?;
-
                 // Update pointer in `binder_buffer_object`.
-                let offset_to_buffer_field =
-                    kernel::offset_of!(bindings::binder_buffer_object, buffer) as usize;
-                let buffer_ptr_in_user_space = view.alloc.ptr + alloc_offset;
                 view.write::<usize>(offset + offset_to_buffer_field, &buffer_ptr_in_user_space)?;
+
+                if obj.flags & bindings::BINDER_BUFFER_FLAG_HAS_PARENT != 0 {
+                    // Look up the parent, which should also be a BINDER_TYPE_PTR. In the parent
+                    // buffer at offset `obj.parent_offset`, we write the pointer to this buffer.
+
+                    let obj_parent_offset =
+                        usize::try_from(obj.parent_offset).map_err(|_| EINVAL)?;
+
+                    let parent_index_offset = obj_parent_offset
+                        .checked_mul(size_of::<usize>())
+                        .and_then(|byte_offset| offsets_start.checked_add(byte_offset))
+                        .ok_or(EINVAL)?;
+
+                    if parent_index_offset >= index_offset {
+                        // This check ensures that the parent buffer has already been translated.
+                        //
+                        // TODO: The C implementation has a stricter check than this. See
+                        // doc-comment on `binder_validate_fixup` for details.
+                        return Err(BinderError::new_failed());
+                    }
+
+                    let parent_obj_offset = view.alloc.read(parent_index_offset)?;
+                    let parent_obj =
+                        view.read::<bindings::binder_buffer_object>(parent_obj_offset)?;
+                    let parent_obj_length =
+                        usize::try_from(parent_obj.length).map_err(|_| EINVAL)?;
+                    let parent_obj_buffer =
+                        usize::try_from(parent_obj.buffer).map_err(|_| EINVAL)?;
+                    if parent_obj.hdr.type_ != BINDER_TYPE_PTR {
+                        return Err(BinderError::new_failed());
+                    }
+                    if parent_obj_length < size_of::<usize>()
+                        || obj_parent_offset < parent_obj_length - size_of::<usize>()
+                    {
+                        return Err(BinderError::new_failed());
+                    }
+
+                    let parent_alloc_offset = parent_obj_buffer.wrapping_sub(view.alloc.ptr);
+                    let offset_to_update = parent_alloc_offset
+                        .checked_add(obj_parent_offset)
+                        .ok_or(EINVAL)?;
+
+                    view.alloc
+                        .write::<usize>(offset_to_update, &buffer_ptr_in_user_space)?;
+                }
             }
             _ => pr_warn!("Unsupported binder object type: {:x}\n", header.type_),
         }
@@ -506,7 +547,9 @@ impl Thread {
     ) -> BinderResult {
         let mut view = AllocationView::new(alloc, start);
         for i in (start..end).step_by(size_of::<usize>()) {
-            if let Err(err) = self.translate_object(i, &mut view, allow_fds, unused_buffer_space) {
+            if let Err(err) =
+                self.translate_object(i, &mut view, allow_fds, start, unused_buffer_space)
+            {
                 alloc.set_info(AllocationInfo { offsets: start..i });
                 return Err(err);
             }

@@ -97,6 +97,25 @@ impl UserSlicePtr {
 /// Used to incrementally read from the user slice.
 pub struct UserSlicePtrReader(*mut core::ffi::c_void, usize);
 
+impl UserSlicePtrReader {
+    /// Skip the provided number of bytes.
+    ///
+    /// Returns an error if skipping more than the length of the buffer.
+    pub fn skip(&mut self, num_skip: usize) -> Result {
+        let new_len = self.1.checked_sub(num_skip).ok_or(EFAULT)?;
+        self.0 = self.0.wrapping_add(num_skip);
+        self.1 = new_len;
+        Ok(())
+    }
+
+    /// Create a reader that can access the same range of data.
+    ///
+    /// Reading from the clone does not advance the current reader.
+    pub fn clone_reader(&self) -> UserSlicePtrReader {
+        UserSlicePtrReader(self.0, self.1)
+    }
+}
+
 impl IoBufferReader for UserSlicePtrReader {
     /// Returns the number of bytes left to be read from this.
     ///

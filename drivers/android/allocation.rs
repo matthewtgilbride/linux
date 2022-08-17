@@ -170,19 +170,14 @@ impl<'a, 'b> AllocationView<'a, 'b> {
         self.alloc.write(offset, obj)
     }
 
-    pub(crate) fn transfer_binder_object<T>(
+    pub(crate) fn transfer_binder_object(
         &self,
         offset: usize,
+        obj: &bindings::flat_binder_object,
         strong: bool,
-        get_node: T,
-    ) -> BinderResult
-    where
-        T: FnOnce(&bindings::flat_binder_object) -> BinderResult<NodeRef>,
-    {
+        node_ref: NodeRef,
+    ) -> BinderResult {
         // TODO: Do we want this function to take a &mut self?
-        let obj = self.read::<bindings::flat_binder_object>(offset)?;
-        let node_ref = get_node(&obj)?;
-
         if core::ptr::eq(&*node_ref.node.owner, self.alloc.process) {
             // The receiving process is the owner of the node, so send it a binder object (instead
             // of a handle).

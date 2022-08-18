@@ -147,7 +147,9 @@ fi
 #
 # `$KRUSTFLAGS` is passed in case the user added `--sysroot`.
 rustc_sysroot=$("$RUSTC" $KRUSTFLAGS --print sysroot)
-rustc_src=${RUST_LIB_SRC:-"$rustc_sysroot/lib/rustlib/src/rust/library"}
+# TODO: Adjust our prebuilts to fit this expected layout rather than adjusting
+# this line from upstream.
+rustc_src=${RUST_LIB_SRC:-"$rustc_sysroot/src/stdlibs/library"}
 rustc_src_core="$rustc_src/core/src/lib.rs"
 if [ ! -e "$rustc_src_core" ]; then
 	if [ "$1" = -v ]; then

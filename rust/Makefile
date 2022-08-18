@@ -36,7 +36,8 @@ ifdef CONFIG_RUST
 # `$(rust_flags)` is passed in case the user added `--sysroot`.
 rustc_sysroot := $(shell $(RUSTC) $(rust_flags) --print sysroot)
 rustc_host_target := $(shell $(RUSTC) --version --verbose | grep -F 'host: ' | cut -d' ' -f2)
-RUST_LIB_SRC ?= $(rustc_sysroot)/lib/rustlib/src/rust/library
+# TODO restructure prebuilts so this change is not needed
+RUST_LIB_SRC ?= $(rustc_sysroot)/src/stdlibs/library
 
 ifeq ($(quiet),silent_)
 cargo_quiet=-q

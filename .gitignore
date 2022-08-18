@@ -37,6 +37,8 @@
 *.o
 *.o.*
 *.patch
+*.rmeta
+*.rsi
 *.s
 *.so
 *.so.dbg
@@ -97,6 +99,10 @@ modules.order
 !.gitattributes
 !.gitignore
 !.mailmap
+!.rustfmt.toml
+
+# XXX: Only for GitHub CI -- do not commit into mainline
+!.github
 
 #
 # Generated include files
@@ -162,3 +168,6 @@ x509.genkey
 
 # Documentation toolchain
 sphinx_*/
+
+# Rust analyzer configuration
+/rust-project.json

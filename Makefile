@@ -474,6 +474,7 @@ KBUILD_USERLDFLAGS := $(USERLDFLAGS)
 
 # These flags apply to all Rust code in the tree, including the kernel and
 # host programs.
+#TODO make linker/link-args get set correctly for gcc vs clang builds
 export rust_common_flags := --edition=2021 \
 			    -Zbinary_dep_depinfo=y \
 			    -Dunsafe_op_in_unsafe_fn -Drust_2018_idioms \
@@ -486,7 +487,8 @@ export rust_common_flags := --edition=2021 \
 			    -Dclippy::let_unit_value -Dclippy::mut_mut \
 			    -Dclippy::needless_bitwise_bool \
 			    -Dclippy::needless_continue \
-			    -Wclippy::dbg_macro
+			    -Wclippy::dbg_macro \
+			    -C linker=clang -C link-arg=-fuse-ld=lld
 
 KBUILD_HOSTCFLAGS   := $(KBUILD_USERHOSTCFLAGS) $(HOST_LFS_CFLAGS) $(HOSTCFLAGS)
 KBUILD_HOSTCXXFLAGS := -Wall -O2 $(HOST_LFS_CFLAGS) $(HOSTCXXFLAGS)

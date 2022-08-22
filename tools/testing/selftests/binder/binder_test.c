@@ -1,5 +1,6 @@
 #include <poll.h>
 #include <pthread.h>
+#include <time.h>
 
 #include <sys/ioctl.h>
 #include <sys/types.h>
@@ -460,6 +461,43 @@ static int prepare_epoll(struct context *ctx)
 	return epfd;
 }
 
+static void set_context_mgr(struct context *ctx)
+{
+	int ret;
+	while (true) {
+		ret = ioctl(ctx->fd, BINDER_SET_CONTEXT_MGR, NULL);
+		if (ret != -1) {
+			return;
+		} else if (errno != EBUSY) {
+			perror("ioctl");
+			exit(1);
+		}
+
+		/*
+		 * The ioctl failed with EBUSY. That is probably because the
+		 * previous test's context manager has not yet been unset.
+		 *
+		 * This can happen because the kernel unsets the context manager
+		 * in a deferred callback, so waiting for the process to exit
+		 * does not guarantee that the context manager has been unset
+		 * yet.
+		 *
+		 * In this case we sleep 1ms and try again.
+		 */
+		struct timespec ts;
+		ts.tv_sec = 0;
+		ts.tv_nsec = 1000000;
+		do {
+			ret = nanosleep(&ts, &ts);
+		} while (ret && errno == EINTR);
+
+		if (ret) {
+			perror("nanosleep");
+			exit(1);
+		}
+	}
+}
+
 static void context_sync(struct context *ctx)
 {
 	char buf = 1;
@@ -551,7 +589,7 @@ TEST(manager_self_acquire)
 
 	context_init(&ctx, -1, default_mapped_size, 0, _metadata);
 
-	ioctl_no_failure(ctx.fd, BINDER_SET_CONTEXT_MGR, NULL);
+	set_context_mgr(&ctx);
 
 	struct __attribute__((__packed__)) {
 		uint32_t cmd;
@@ -573,7 +611,7 @@ TEST(manager_self_increfs)
 
 	context_init(&ctx, -1, default_mapped_size, 0, _metadata);
 
-	ioctl_no_failure(ctx.fd, BINDER_SET_CONTEXT_MGR, NULL);
+	set_context_mgr(&ctx);
 
 	struct __attribute__((__packed__)) {
 		uint32_t cmd;
@@ -619,7 +657,7 @@ static void server_closed(struct __test_metadata *_metadata,
 	struct context ctx;
 
 	context_init(&ctx, comm_fd, default_mapped_size, index, _metadata);
-	ioctl_no_failure(ctx.fd, BINDER_SET_CONTEXT_MGR, NULL);
+	set_context_mgr(&ctx);
 
 	close(ctx.fd);
 	munmap(ctx.shared_ptr, ctx.size);
@@ -713,7 +751,7 @@ BINDER_TEST(server_dies, client_gets_dead_reply)
 	struct binder_transaction_data *tr;
 
 	context_init(&ctx, comm_fd, default_mapped_size, index, _metadata);
-	ioctl_no_failure(ctx.fd, BINDER_SET_CONTEXT_MGR, NULL);
+	set_context_mgr(&ctx);
 
 	context_sync(&ctx);
 	context_sync(&ctx);
@@ -740,7 +778,7 @@ static void server_dies_queued_trans(struct __test_metadata *_metadata,
 	struct context ctx;
 
 	context_init(&ctx, comm_fd, default_mapped_size, index, _metadata);
-	ioctl_no_failure(ctx.fd, BINDER_SET_CONTEXT_MGR, NULL);
+	set_context_mgr(&ctx);
 
 	context_sync(&ctx);
 
@@ -781,7 +819,7 @@ BINDER_TEST(server_thread_exits, client_gets_dead_reply)
 	struct binder_transaction_data *tr;
 
 	context_init(&ctx, comm_fd, default_mapped_size, index, _metadata);
-	ioctl_no_failure(ctx.fd, BINDER_SET_CONTEXT_MGR, NULL);
+	set_context_mgr(&ctx);
 
 	context_sync(&ctx);
 	context_sync(&ctx);
@@ -903,7 +941,7 @@ BINDER_TEST(server_thread_exits_then_resurrects,
 	struct binder_transaction_data *tr;
 
 	context_init(&ctx, comm_fd, default_mapped_size, index, _metadata);
-	ioctl_no_failure(ctx.fd, BINDER_SET_CONTEXT_MGR, NULL);
+	set_context_mgr(&ctx);
 
 	context_sync(&ctx);
 
@@ -940,7 +978,7 @@ static void server_empty_reply(struct __test_metadata *_metadata,
 	struct binder_transaction_data *tr;
 
 	context_init(&ctx, comm_fd, default_mapped_size, index, _metadata);
-	ioctl_no_failure(ctx.fd, BINDER_SET_CONTEXT_MGR, NULL);
+	set_context_mgr(&ctx);
 
 	context_sync(&ctx);
 	context_sync(&ctx);
@@ -1014,7 +1052,7 @@ static void server_epoll_wait(struct __test_metadata *_metadata,
 	struct epoll_event ev;
 
 	context_init(&ctx, comm_fd, default_mapped_size, index, _metadata);
-	ioctl_no_failure(ctx.fd, BINDER_SET_CONTEXT_MGR, NULL);
+	set_context_mgr(&ctx);
 	ASSERT_LE(0, epfd = prepare_epoll(&ctx));
 
 	cmd = BC_ENTER_LOOPER;
@@ -1249,7 +1287,7 @@ static void server_no_transaction(struct __test_metadata *_metadata,
 	char data[256];
 
 	context_init(&ctx, comm_fd, default_mapped_size, index, _metadata);
-	ioctl_no_failure(ctx.fd, BINDER_SET_CONTEXT_MGR, NULL);
+	set_context_mgr(&ctx);
 
 	context_sync(&ctx);
 
@@ -2097,7 +2135,7 @@ static void server_reply_with_fd(struct __test_metadata *_metadata,
 	int pipe_fds[2];
 
 	context_init(&ctx, comm_fd, default_mapped_size, index, _metadata);
-	ioctl_no_failure(ctx.fd, BINDER_SET_CONTEXT_MGR, NULL);
+	set_context_mgr(&ctx);
 
 	context_sync(&ctx);
 
@@ -2232,7 +2270,7 @@ static void server_fail_reply_with_fd(struct __test_metadata *_metadata,
 	int pipe_fds[2];
 
 	context_init(&ctx, comm_fd, default_mapped_size, index, _metadata);
-	ioctl_no_failure(ctx.fd, BINDER_SET_CONTEXT_MGR, NULL);
+	set_context_mgr(&ctx);
 
 	context_sync(&ctx);
 
@@ -2340,7 +2378,7 @@ static void server_receive_handle(struct __test_metadata *_metadata,
 
 	context_init(&ctx, comm_fd, default_mapped_size, index, _metadata);
 
-	ioctl_no_failure(ctx.fd, BINDER_SET_CONTEXT_MGR, NULL);
+	set_context_mgr(&ctx);
 
 	context_sync(&ctx);
 
@@ -2664,7 +2702,7 @@ static void server_inline_callback(struct __test_metadata *_metadata,
 
 	context_init(&ctx, comm_fd, default_mapped_size, index, _metadata);
 
-	ioctl_no_failure(ctx.fd, BINDER_SET_CONTEXT_MGR, NULL);
+	set_context_mgr(&ctx);
 
 	context_sync(&ctx);
 
@@ -2782,7 +2820,7 @@ static void server_callback_fails_dead(struct __test_metadata *_metadata,
 
 	context_init(&ctx, comm_fd, default_mapped_size, index, _metadata);
 
-	ioctl_no_failure(ctx.fd, BINDER_SET_CONTEXT_MGR, NULL);
+	set_context_mgr(&ctx);
 
 	context_sync(&ctx);
 
@@ -2954,7 +2992,7 @@ BINDER_TEST(max_threads, client_send_transactions)
 	uint32_t cmd;
 
 	context_init(&ctx, comm_fd, default_mapped_size, index, _metadata);
-	ioctl_no_failure(ctx.fd, BINDER_SET_CONTEXT_MGR, NULL);
+	set_context_mgr(&ctx);
 
 	{
 		uint32_t v = 2;

@@ -55,7 +55,7 @@ pub_no_prefix!(transaction_flags_, TF_ONE_WAY, TF_ACCEPT_FDS);
 
 pub(crate) use bindings::{
     BINDER_TYPE_BINDER, BINDER_TYPE_FD, BINDER_TYPE_HANDLE, BINDER_TYPE_WEAK_BINDER,
-    BINDER_TYPE_WEAK_HANDLE, FLAT_BINDER_FLAG_ACCEPTS_FDS,
+    BINDER_TYPE_WEAK_HANDLE, flat_binder_object_flags_FLAT_BINDER_FLAG_ACCEPTS_FDS as FLAT_BINDER_FLAG_ACCEPTS_FDS,
 };
 
 macro_rules! decl_wrapper {

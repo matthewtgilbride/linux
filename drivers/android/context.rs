@@ -47,6 +47,7 @@ impl Context {
     pub(crate) fn set_manager_node(&self, node_ref: NodeRef) -> Result {
         let mut manager = self.manager.lock();
         if manager.node.is_some() {
+            pr_warn!("BINDER_SET_CONTEXT_MGR already set");
             return Err(EBUSY);
         }
         security::binder_set_context_mgr(&node_ref.node.owner.cred)?;

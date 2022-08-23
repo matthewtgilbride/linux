@@ -81,17 +81,127 @@ struct ScatterGatherEntry {
     sender_uaddr: usize,
     /// Number of bytes to copy.
     length: usize,
+    /// The minimum offset of the next fixup in this buffer.
+    fixup_min_offset: usize,
     /// The offsets within this buffer that contain pointers which should be translated.
     pointer_fixups: Vec<PointerFixupEntry>,
 }
 
-/// This entry specifies that the given `u64` should be written at `target_offset` of the buffer.
+/// This entry specifies that a fixup should happen at `target_offset` of the
+/// buffer. If `skip` is nonzero, then the fixup is a `binder_fd_array_object`
+/// and is applied later. Otherwise if `skip` is zero, then the size of the
+/// fixup is `sizeof::<u64>()` and `pointer_value` is written to the buffer.
 struct PointerFixupEntry {
-    /// The value that should be written to the target buffer at the given offset.
+    /// The number of bytes to skip, or zero for a `binder_buffer_object` fixup.
+    skip: usize,
+    /// The translated pointer to write when `skip` is zero.
     pointer_value: u64,
-    /// The offset at which the value should be written. The offset is relative to the original
-    /// buffer, so it is between `sg_entry.offset` and `sg_entry.offset + sg_entry.length - 8`.
+    /// The offset at which the value should be written. The offset is relative
+    /// to the original buffer.
     target_offset: usize,
+}
+
+/// Return type of `apply_and_validate_fixup_in_parent`.
+struct ParentFixupInfo {
+    /// The index of the parent buffer in `sg_entries`.
+    parent_sg_index: usize,
+    /// The number of ancestors of the buffer.
+    ///
+    /// The buffer is considered an ancestor of itself, so this is always at
+    /// least one.
+    num_ancestors: usize,
+    /// New value of `fixup_min_offset` if this fixup is applied.
+    new_min_offset: usize,
+    /// The offset of the fixup in the target buffer.
+    target_offset: usize,
+}
+
+impl ScatterGatherState {
+    /// Called when a `binder_buffer_object` or `binder_fd_array_object` tries
+    /// to access a region in its parent buffer. These accesses have various
+    /// restrictions, which this method verifies.
+    ///
+    /// The `parent_offset` and `length` arguments describe the offset and
+    /// length of the access in the parent buffer.
+    ///
+    /// # Detailed restrictions
+    ///
+    /// Obviously the fixup must be in-bounds for the parent buffer.
+    ///
+    /// For safety reasons, we only allow fixups inside a buffer to happen
+    /// at increasing offsets; additionally, we only allow fixup on the last
+    /// buffer object that was verified, or one of its parents.
+    ///
+    /// Example of what is allowed:
+    ///
+    /// A
+    ///   B (parent = A, offset = 0)
+    ///   C (parent = A, offset = 16)
+    ///     D (parent = C, offset = 0)
+    ///   E (parent = A, offset = 32) // min_offset is 16 (C.parent_offset)
+    ///
+    /// Examples of what is not allowed:
+    ///
+    /// Decreasing offsets within the same parent:
+    /// A
+    ///   C (parent = A, offset = 16)
+    ///   B (parent = A, offset = 0) // decreasing offset within A
+    ///
+    /// Referring to a parent that wasn't the last object or any of its parents:
+    /// A
+    ///   B (parent = A, offset = 0)
+    ///   C (parent = A, offset = 0)
+    ///   C (parent = A, offset = 16)
+    ///     D (parent = B, offset = 0) // B is not A or any of A's parents
+    fn validate_parent_fixup(
+        &self,
+        parent: usize,
+        parent_offset: usize,
+        length: usize,
+    ) -> Result<ParentFixupInfo> {
+        // Using `position` would also be correct, but `rposition` avoids
+        // quadratic running times.
+        let ancestors_i = self
+            .ancestors
+            .iter()
+            .copied()
+            .rposition(|sg_idx| self.sg_entries[sg_idx].obj_index == parent)
+            .ok_or(EINVAL)?;
+
+        let sg_idx = self.ancestors[ancestors_i];
+        let sg_entry = match self.sg_entries.get(sg_idx) {
+            Some(sg_entry) => sg_entry,
+            None => {
+                pr_err!(
+                    "self.ancestors[{}] is {}, but self.sg_entries.len() is {}",
+                    ancestors_i,
+                    sg_idx,
+                    self.sg_entries.len()
+                );
+                return Err(EINVAL);
+            }
+        };
+
+        if sg_entry.fixup_min_offset > parent_offset {
+            return Err(EINVAL);
+        }
+
+        let new_min_offset = parent_offset.checked_add(length).ok_or(EINVAL)?;
+        if new_min_offset > sg_entry.length {
+            return Err(EINVAL);
+        }
+
+        let target_offset = sg_entry.offset.checked_add(parent_offset).ok_or(EINVAL)?;
+
+        // The `ancestors_i + 1` operation can't overflow since the result is
+        // at most `self.ancestors.len()`, which also fits in an usize.
+        Ok(ParentFixupInfo {
+            parent_sg_index: sg_idx,
+            num_ancestors: ancestors_i + 1,
+            new_min_offset,
+            target_offset,
+        })
+    }
 }
 
 /// Keeps track of how much unused buffer space is left. The initial amount is the number of bytes
@@ -522,6 +632,7 @@ impl Thread {
                         sender_uaddr: obj.buffer as _,
                         length: obj_length,
                         pointer_fixups: Vec::new(),
+                        fixup_min_offset: 0,
                     })
                     .map_err(|_| ENOMEM)?;
 
@@ -536,77 +647,39 @@ impl Thread {
                 } else {
                     // Another buffer also has a pointer to this buffer, and we need to fixup that
                     // pointer too.
-                    //
-                    // For safety reasons, we only allow fixups inside a buffer to happen
-                    // at increasing offsets; additionally, we only allow fixup on the last
-                    // buffer object that was verified, or one of its parents.
-                    //
-                    // Example of what is allowed:
-                    //
-                    // A
-                    //   B (parent = A, offset = 0)
-                    //   C (parent = A, offset = 16)
-                    //     D (parent = C, offset = 0)
-                    //   E (parent = A, offset = 32) // min_offset is 16 (C.parent_offset)
-                    //
-                    // Examples of what is not allowed:
-                    //
-                    // Decreasing offsets within the same parent:
-                    // A
-                    //   C (parent = A, offset = 16)
-                    //   B (parent = A, offset = 0) // decreasing offset within A
-                    //
-                    // Referring to a parent that wasn't the last object or any of its parents:
-                    // A
-                    //   B (parent = A, offset = 0)
-                    //   C (parent = A, offset = 0)
-                    //   C (parent = A, offset = 16)
-                    //     D (parent = B, offset = 0) // B is not A or any of A's parents
 
                     let parent_index = usize::try_from(obj.parent).map_err(|_| EINVAL)?;
                     let parent_offset = usize::try_from(obj.parent_offset).map_err(|_| EINVAL)?;
 
-                    // This loop verifies that the parent is the previous `binder_buffer_object` or
-                    // one of its ancestors, and if so, it modifies `ancestors` to contain the
-                    // ancestors of the current `binder_buffer_object` instead.
-                    let parent_sg_index = loop {
-                        match sg_state.ancestors.last() {
-                            Some(&last) if sg_state.sg_entries[last].obj_index == parent_index => {
-                                sg_state
-                                    .ancestors
-                                    .try_push(sg_state_idx)
-                                    .map_err(|_| ENOMEM)?;
-                                break last;
-                            }
-                            Some(_) => {
-                                sg_state.ancestors.pop();
-                            }
-                            None => return Err(BinderError::new_failed()),
+                    let info = sg_state.validate_parent_fixup(
+                        parent_index,
+                        parent_offset,
+                        size_of::<u64>(),
+                    )?;
+
+                    sg_state.ancestors.truncate(info.num_ancestors);
+                    sg_state
+                        .ancestors
+                        .try_push(sg_state_idx)
+                        .map_err(|_| ENOMEM)?;
+
+                    let parent_entry = match sg_state.sg_entries.get_mut(info.parent_sg_index) {
+                        Some(parent_entry) => parent_entry,
+                        None => {
+                            pr_err!(
+                                "validate_parent_fixup returned index out of bounds for sg.entries"
+                            );
+                            return Err(EINVAL.into());
                         }
                     };
 
-                    let parent_entry = &mut sg_state.sg_entries[parent_sg_index];
-                    if parent_entry.length < size_of::<u64>()
-                        || parent_offset < parent_entry.length - size_of::<u64>()
-                    {
-                        return Err(BinderError::new_failed());
-                    }
-
-                    let target_offset = parent_entry
-                        .offset
-                        .checked_add(parent_offset)
-                        .ok_or(EINVAL)?;
-                    if let Some(prev_fixup) = parent_entry.pointer_fixups.last() {
-                        if target_offset < prev_fixup.target_offset + size_of::<u64>() {
-                            return Err(BinderError::new_failed());
-                        }
-                    }
-
+                    parent_entry.fixup_min_offset = info.new_min_offset;
                     parent_entry
                         .pointer_fixups
                         .try_push(PointerFixupEntry {
+                            skip: 0,
                             pointer_value: buffer_ptr_in_user_space,
-                            target_offset,
+                            target_offset: info.target_offset,
                         })
                         .map_err(|_| ENOMEM)?;
                 }
@@ -632,10 +705,13 @@ impl Thread {
             let mut reader =
                 unsafe { UserSlicePtr::new(sg_entry.sender_uaddr as _, sg_entry.length) }.reader();
             for fixup in &mut sg_entry.pointer_fixups {
-                let target_offset_end = fixup
-                    .target_offset
-                    .checked_add(size_of::<u64>())
-                    .ok_or(EINVAL)?;
+                let fixup_len = if fixup.skip == 0 {
+                    size_of::<u64>()
+                } else {
+                    fixup.skip
+                };
+
+                let target_offset_end = fixup.target_offset.checked_add(fixup_len).ok_or(EINVAL)?;
 
                 if fixup.target_offset < end_of_previous_fixup || offset_end < target_offset_end {
                     return Err(EINVAL.into());
@@ -644,7 +720,9 @@ impl Thread {
                 let copy_off = end_of_previous_fixup;
                 let copy_len = fixup.target_offset - end_of_previous_fixup;
                 alloc.copy_into(&mut reader, copy_off, copy_len)?;
-                alloc.write::<u64>(fixup.target_offset, &fixup.pointer_value)?;
+                if fixup.skip == 0 {
+                    alloc.write::<u64>(fixup.target_offset, &fixup.pointer_value)?;
+                }
                 end_of_previous_fixup = target_offset_end;
             }
 

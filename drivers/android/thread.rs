@@ -688,6 +688,69 @@ impl Thread {
                 obj.buffer = buffer_ptr_in_user_space;
                 view.write::<bindings::binder_buffer_object>(offset, &*obj)?;
             }
+            BinderObjectRef::Fda(obj) => {
+                let parent_index = usize::try_from(obj.parent).map_err(|_| EINVAL)?;
+                let parent_offset = usize::try_from(obj.parent_offset).map_err(|_| EINVAL)?;
+                let num_fds = usize::try_from(obj.num_fds).map_err(|_| EINVAL)?;
+                let fds_len = num_fds.checked_mul(size_of::<u32>()).ok_or(EINVAL)?;
+
+                let info = sg_state.validate_parent_fixup(parent_index, parent_offset, fds_len)?;
+
+                sg_state.ancestors.truncate(info.num_ancestors);
+                let parent_entry = match sg_state.sg_entries.get_mut(info.parent_sg_index) {
+                    Some(parent_entry) => parent_entry,
+                    None => {
+                        pr_err!(
+                            "validate_parent_fixup returned index out of bounds for sg.entries"
+                        );
+                        return Err(EINVAL.into());
+                    }
+                };
+
+                parent_entry.fixup_min_offset = info.new_min_offset;
+                parent_entry
+                    .pointer_fixups
+                    .try_push(PointerFixupEntry {
+                        skip: fds_len,
+                        pointer_value: 0,
+                        target_offset: info.target_offset,
+                    })
+                    .map_err(|_| ENOMEM)?;
+
+                let fda_uaddr = parent_entry
+                    .sender_uaddr
+                    .checked_add(parent_offset)
+                    .ok_or(EINVAL)?;
+                let fda_bytes = unsafe { UserSlicePtr::new(fda_uaddr as _, fds_len) }.read_all()?;
+
+                if fds_len != fda_bytes.len() {
+                    pr_err!("UserSlicePtr::read_all returned wrong length in BINDER_TYPE_FDA");
+                    return Err(EINVAL.into());
+                }
+
+                for i in (0..fds_len).step_by(size_of::<u32>()) {
+                    let fd = {
+                        let mut fd_bytes = [0u8; size_of::<u32>()];
+                        fd_bytes.copy_from_slice(&fda_bytes[i..i + size_of::<u32>()]);
+                        u32::from_ne_bytes(fd_bytes)
+                    };
+
+                    let file = File::from_fd(fd)?;
+                    security::binder_transfer_file(
+                        &self.process.cred,
+                        &view.alloc.process.cred,
+                        &file,
+                    )?;
+
+                    // The `validate_parent_fixup` call ensuers that this addition will not
+                    // overflow.
+                    let file_info = Box::try_new(FileInfo::new(file, info.target_offset + i))?;
+                    view.alloc.add_file_info(file_info);
+                }
+                drop(fda_bytes);
+
+                view.write::<bindings::binder_fd_array_object>(offset, &*obj)?;
+            }
         }
 
         Ok(())
@@ -1238,7 +1301,7 @@ enum BinderObjectRef<'a> {
     Handle(&'a mut bindings::flat_binder_object),
     Fd(&'a mut bindings::binder_fd_object),
     Ptr(&'a mut bindings::binder_buffer_object),
-    //Fda(&'a bindings::binder_fd_array_object),
+    Fda(&'a mut bindings::binder_fd_array_object),
 }
 
 impl BinderObject {
@@ -1283,7 +1346,7 @@ impl BinderObject {
             BINDER_TYPE_HANDLE => Ok(size_of::<bindings::flat_binder_object>()),
             BINDER_TYPE_FD => Ok(size_of::<bindings::binder_fd_object>()),
             BINDER_TYPE_PTR => Ok(size_of::<bindings::binder_buffer_object>()),
-            //BINDER_TYPE_FDA => Ok(size_of::<bindings::binder_fd_array_object>()),
+            BINDER_TYPE_FDA => Ok(size_of::<bindings::binder_fd_array_object>()),
             _ => Err(EINVAL),
         }
     }
@@ -1298,7 +1361,7 @@ impl BinderObject {
                 BINDER_TYPE_WEAK_HANDLE | BINDER_TYPE_HANDLE => Ok(Handle(&mut self.fbo)),
                 BINDER_TYPE_FD => Ok(Fd(&mut self.fdo)),
                 BINDER_TYPE_PTR => Ok(Ptr(&mut self.bbo)),
-                //BINDER_TYPE_FDA => Fda(&mut self.fdao),
+                BINDER_TYPE_FDA => Ok(Fda(&mut self.fdao)),
                 _ => Err(EINVAL),
             }
         }

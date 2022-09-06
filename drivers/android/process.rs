@@ -786,6 +786,7 @@ impl IoctlHandler for Process {
             bindings::BINDER_SET_CONTEXT_MGR_EXT => {
                 this.set_as_manager(Some(reader.read()?), &thread)?
             }
+            bindings::BINDER_ENABLE_ONEWAY_SPAM_DETECTION => { /* do nothing */ },
             _ => return Err(EINVAL),
         }
         Ok(0)

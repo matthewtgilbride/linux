@@ -99,6 +99,7 @@ decl_wrapper!(
 );
 decl_wrapper!(BinderWriteRead, bindings::binder_write_read);
 decl_wrapper!(BinderVersion, bindings::binder_version);
+decl_wrapper!(BinderfsDevice, bindings::binderfs_device);
 
 impl BinderVersion {
     pub(crate) fn current() -> Self {

@@ -38,6 +38,7 @@
 #include <linux/uidgid.h>
 #include <linux/uio.h>
 #include <uapi/linux/android/binder.h>
+#include <uapi/linux/android/binderfs.h>
 #include <linux/fs_parser.h>
 
 /* `bindgen` gets confused at certain things. */

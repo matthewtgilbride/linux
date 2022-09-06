@@ -28,6 +28,7 @@ use crate::{
 
 pub(crate) type BinderResult<T = ()> = core::result::Result<T, BinderError>;
 
+#[derive(Debug)]
 pub(crate) struct BinderError {
     pub(crate) reply: u32,
 }
@@ -183,11 +184,19 @@ impl ScatterGatherState {
         };
 
         if sg_entry.fixup_min_offset > parent_offset {
+            pr_warn!(
+                "validate_parent_fixup: fixup_min_offset={}, parent_offset={}",
+                sg_entry.fixup_min_offset,
+                parent_offset);
             return Err(EINVAL);
         }
 
         let new_min_offset = parent_offset.checked_add(length).ok_or(EINVAL)?;
         if new_min_offset > sg_entry.length {
+            pr_warn!(
+                "validate_parent_fixup: new_min_offset={}, sg_entry.length={}",
+                new_min_offset,
+                sg_entry.length);
             return Err(EINVAL);
         }
 
@@ -219,12 +228,7 @@ impl UnusedBufferSpace {
     /// into the buffer is returned.
     fn claim_next(&mut self, size: usize) -> Result<usize> {
         // We require every chunk to be aligned.
-        let mut size = ptr_align(size);
-        if size == 0 {
-            // Ensure that each buffer has a unique address.
-            size = size_of::<usize>();
-        }
-
+        let size = ptr_align(size);
         let new_offset = self.offset.checked_add(size).ok_or(EINVAL)?;
 
         if new_offset <= self.limit {
@@ -621,7 +625,18 @@ impl Thread {
             }
             BinderObjectRef::Ptr(obj) => {
                 let obj_length = obj.length.try_into().map_err(|_| EINVAL)?;
-                let alloc_offset = sg_state.unused_buffer_space.claim_next(obj_length)?;
+                let alloc_offset = match sg_state.unused_buffer_space.claim_next(obj_length) {
+                    Ok(alloc_offset) => alloc_offset,
+                    Err(err) => {
+                        pr_warn!(
+                            "Failed to claim space for a BINDER_TYPE_PTR. (offset: {}, limit: {}, size: {})",
+                            sg_state.unused_buffer_space.offset,
+                            sg_state.unused_buffer_space.limit,
+                            obj_length,
+                        );
+                        return Err(err.into());
+                    },
+                };
 
                 let sg_state_idx = sg_state.sg_entries.len();
                 sg_state
@@ -686,7 +701,10 @@ impl Thread {
 
                 // Update pointer in `binder_buffer_object`.
                 obj.buffer = buffer_ptr_in_user_space;
-                view.write::<bindings::binder_buffer_object>(offset, &*obj)?;
+                if let Err(err) = view.write::<bindings::binder_buffer_object>(offset, &*obj) {
+                    pr_warn!("Failed to write BINDER_TYPE_PTR to view: {:?}", err);
+                    return Err(err.into());
+                }
             }
             BinderObjectRef::Fda(obj) => {
                 let parent_index = usize::try_from(obj.parent).map_err(|_| EINVAL)?;
@@ -762,7 +780,7 @@ impl Thread {
         sg_state: &mut ScatterGatherState,
     ) -> BinderResult {
         for sg_entry in &mut sg_state.sg_entries {
-            let mut end_of_previous_fixup = 0;
+            let mut end_of_previous_fixup = sg_entry.offset;
             let offset_end = sg_entry.offset.checked_add(sg_entry.length).ok_or(EINVAL)?;
 
             let mut reader =
@@ -777,21 +795,39 @@ impl Thread {
                 let target_offset_end = fixup.target_offset.checked_add(fixup_len).ok_or(EINVAL)?;
 
                 if fixup.target_offset < end_of_previous_fixup || offset_end < target_offset_end {
+                    pr_warn!("Fixups oob {} {} {} {}",
+                             fixup.target_offset,
+                             end_of_previous_fixup,
+                             offset_end,
+                             target_offset_end);
                     return Err(EINVAL.into());
                 }
 
                 let copy_off = end_of_previous_fixup;
                 let copy_len = fixup.target_offset - end_of_previous_fixup;
-                alloc.copy_into(&mut reader, copy_off, copy_len)?;
+                if let Err(err) = alloc.copy_into(&mut reader, copy_off, copy_len) {
+                    pr_warn!("Failed copying into alloc: {:?}", err);
+                    return Err(err.into());
+                }
                 if fixup.skip == 0 {
-                    alloc.write::<u64>(fixup.target_offset, &fixup.pointer_value)?;
+                    if let Err(err) = alloc.write::<u64>(fixup.target_offset, &fixup.pointer_value) {
+                        pr_warn!("Failed copying ptr into alloc: {:?}", err);
+                        return Err(err.into());
+                    }
+                }
+                if let Err(err) = reader.skip(fixup_len) {
+                    pr_warn!("Failed skipping {} from reader: {:?}", fixup_len, err);
+                    return Err(err.into());
                 }
                 end_of_previous_fixup = target_offset_end;
             }
 
             let copy_off = end_of_previous_fixup;
             let copy_len = offset_end - end_of_previous_fixup;
-            alloc.copy_into(&mut reader, copy_off, copy_len)?;
+            if let Err(err) = alloc.copy_into(&mut reader, copy_off, copy_len) {
+                pr_warn!("Failed copying remainder into alloc: {:?}", err);
+                return Err(err.into());
+            }
         }
         Ok(())
     }
@@ -807,7 +843,14 @@ impl Thread {
 
         let mut secctx = if let Some(offset) = txn_security_ctx_offset {
             let secid = self.process.cred.get_secid();
-            Some((offset, security::SecurityCtx::from_secid(secid)?))
+            let ctx = match security::SecurityCtx::from_secid(secid) {
+                Ok(ctx) => ctx,
+                Err(err) => {
+                    pr_warn!("Failed to get security ctx for id {}: {:?}", secid, err);
+                    return Err(err.into());
+                },
+            };
+            Some((offset, ctx))
         } else {
             None
         };
@@ -888,6 +931,7 @@ impl Thread {
                 ) {
                     Ok(()) => end_of_previous_object = offset + object.size()?,
                     Err(err) => {
+                        pr_warn!("Error while translating object.");
                         alloc.set_info(AllocationInfo {
                             offsets: offsets_start..index_offset,
                         });
@@ -908,11 +952,17 @@ impl Thread {
         )?;
 
         if let Some(sg_state) = sg_state.as_mut() {
-            self.apply_sg(&mut alloc, sg_state)?;
+            if let Err(err) = self.apply_sg(&mut alloc, sg_state) {
+                pr_warn!("Failure in apply_sg: {:?}", err);
+                return Err(err.into());
+            }
         }
 
         if let Some((off_out, secctx)) = secctx.as_mut() {
-            alloc.write(secctx_off, secctx.as_bytes())?;
+            if let Err(err) = alloc.write(secctx_off, secctx.as_bytes()) {
+                pr_warn!("Failed to write security context: {:?}", err);
+                return Err(err.into());
+            }
             **off_out = secctx_off;
         }
 
@@ -989,6 +1039,7 @@ impl Thread {
         T: FnOnce(&Ref<Self>, &BinderTransactionDataSg) -> BinderResult,
     {
         if let Err(err) = inner(self, tr) {
+            pr_warn!("Transaction failed: {}", err.reply);
             self.inner.lock().push_return_work(err.reply);
         }
     }
@@ -1012,6 +1063,7 @@ impl Thread {
         .map_err(|mut err| {
             // At this point we only return `BR_TRANSACTION_COMPLETE` to the caller, and we must let
             // the sender know that the transaction has completed (with an error in this case).
+            pr_warn!("Failure during reply - delivering BR_FAILED_REPLY to sender.");
             let reply = Either::Right(BR_FAILED_REPLY);
             orig.from.deliver_reply(reply, &orig);
             err.reply = BR_TRANSACTION_COMPLETE;
@@ -1081,7 +1133,8 @@ impl Thread {
 
         while reader.len() >= size_of::<u32>() && self.inner.lock().return_work.is_some() {
             let before = reader.len();
-            match reader.read::<u32>()? {
+            let cmd = reader.read::<u32>()?;
+            match cmd {
                 BC_TRANSACTION => {
                     let tr = reader.read::<BinderTransactionData>()?.with_buffers_size(0);
                     if tr.transaction_data.flags & TF_ONE_WAY != 0 {
@@ -1197,6 +1250,7 @@ impl Thread {
         // Go through the write buffer.
         if req.write_size > 0 {
             if let Err(err) = self.write(&mut req) {
+                pr_warn!("Write failure {:?}", err);
                 req.read_consumed = 0;
                 writer.write(&req)?;
                 return Err(err);
@@ -1207,6 +1261,9 @@ impl Thread {
         let mut ret = Ok(());
         if req.read_size > 0 {
             ret = self.read(&mut req, wait);
+            if ret.is_err() {
+                pr_warn!("Read failure {:?}", ret);
+            }
         }
 
         // Write the request back so that the consumed fields are visible to the caller.

@@ -57,7 +57,13 @@ impl Transaction {
         let txn_security_ctx = node_ref.node.flags & FLAT_BINDER_FLAG_TXN_SECURITY_CTX != 0;
         let mut txn_security_ctx_off = if txn_security_ctx { Some(0) } else { None };
         let to = node_ref.node.owner.clone();
-        let mut alloc = from.copy_transaction_data(&to, tr, allow_fds, txn_security_ctx_off.as_mut())?;
+        let mut alloc = match from.copy_transaction_data(&to, tr, allow_fds, txn_security_ctx_off.as_mut()) {
+            Ok(alloc) => alloc,
+            Err(err) => {
+                pr_warn!("Failure in copy_transaction_data");
+                return Err(err);
+            },
+        };
         let data_address = alloc.ptr;
         let file_list = alloc.take_file_list();
         alloc.keep_alive();
@@ -93,7 +99,13 @@ impl Transaction {
         allow_fds: bool,
     ) -> BinderResult<Ref<Self>> {
         let trd = &tr.transaction_data;
-        let mut alloc = from.copy_transaction_data(&to, tr, allow_fds, None)?;
+        let mut alloc = match from.copy_transaction_data(&to, tr, allow_fds, None) {
+            Ok(alloc) => alloc,
+            Err(err) => {
+                pr_warn!("Failure in copy_transaction_data");
+                return Err(err);
+            },
+        };
         let data_address = alloc.ptr;
         let file_list = alloc.take_file_list();
         alloc.keep_alive();
@@ -246,7 +258,8 @@ impl DeliverToRead for Transaction {
             // Not a reply and not one-way.
             let from_proc = &*self.from.process;
             if !from_proc.is_dead() {
-                tr.sender_pid = from_proc.task.pid_in_current_ns();
+                let pid = from_proc.task.pid_in_current_ns();
+                tr.sender_pid = pid;
             }
         }
 

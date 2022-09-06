@@ -7,12 +7,19 @@
 use kernel::{
     io_buffer::IoBufferWriter,
     linked_list::{GetLinks, GetLinksWrapped, Links},
-    miscdev::Registration,
+    file::{File, PollTable, Operations},
     prelude::*,
     str::CStr,
     sync::Ref,
     user_ptr::UserSlicePtrWriter,
+    PointerWrapper,
+    bindings,
 };
+
+#[cfg(not(CONFIG_ANDROID_BINDERFS_RUST))]
+use kernel::miscdev::Registration;
+
+use core::mem::ManuallyDrop;
 
 mod allocation;
 mod context;
@@ -23,7 +30,7 @@ mod range_alloc;
 mod thread;
 mod transaction;
 
-use {context::Context, thread::Thread};
+use {context::Context, thread::Thread, process::Process};
 
 module! {
     type: BinderModule,
@@ -94,13 +101,177 @@ const fn ptr_align(value: usize) -> usize {
 unsafe impl Sync for BinderModule {}
 
 struct BinderModule {
-    _reg: Pin<Box<Registration<process::Process>>>,
+    #[cfg(not(CONFIG_ANDROID_BINDERFS_RUST))]
+    _reg: Pin<Box<Registration<Process>>>,
 }
 
+extern "C" {
+    fn init_rust_binderfs() -> core::ffi::c_int; 
+}
+
+#[cfg(not(CONFIG_ANDROID_BINDERFS_RUST))]
 impl kernel::Module for BinderModule {
     fn init(name: &'static CStr, _module: &'static kernel::ThisModule) -> Result<Self> {
-        let ctx = Context::new()?;
+        let ctx = Context::new(name)?;
         let reg = Registration::new_pinned(fmt!("{name}"), ctx)?;
-        Ok(Self { _reg: reg })
+
+        Ok(Self {
+            _reg: reg,
+        })
+    }
+}
+
+#[cfg(CONFIG_ANDROID_BINDERFS_RUST)]
+impl kernel::Module for BinderModule {
+    fn init(_name: &'static CStr, _module: &'static kernel::ThisModule) -> Result<Self> {
+        unsafe {
+            kernel::error::to_result(init_rust_binderfs())?;
+        }
+
+        Ok(Self { })
+    }
+}
+
+/// Makes the inner type Sync.
+#[repr(transparent)]
+pub struct AssertSync<T>(T);
+unsafe impl<T> Sync for AssertSync<T> {}
+
+/// File operations that rust_binderfs.c can use.
+#[no_mangle]
+#[used]
+pub static rust_binder_fops: AssertSync<kernel::bindings::file_operations> = {
+    let ops = kernel::bindings::file_operations {
+        owner: THIS_MODULE.as_ptr(),
+        poll: Some(rust_binder_poll),
+        unlocked_ioctl: Some(rust_binder_unlocked_ioctl),
+        compat_ioctl: Some(rust_binder_compat_ioctl),
+        mmap: Some(rust_binder_mmap),
+        open: Some(rust_binder_open),
+        release: Some(rust_binder_release),
+        llseek: None,
+        read: None,
+        write: None,
+        read_iter: None,
+        write_iter: None,
+        iopoll: None,
+        iterate: None,
+        iterate_shared: None,
+        mmap_supported_flags: 0,
+        flush: None,
+        fsync: None,
+        fasync: None,
+        lock: None,
+        sendpage: None,
+        get_unmapped_area: None,
+        check_flags: None,
+        flock: None,
+        splice_write: None,
+        splice_read: None,
+        setlease: None,
+        fallocate: None,
+        show_fdinfo: None,
+        copy_file_range: None,
+        remap_file_range: None,
+        fadvise: None,
+        uring_cmd: None,
+    };
+
+    AssertSync(ops)
+};
+
+#[no_mangle]
+unsafe extern "C" fn rust_binder_new_device() -> *mut core::ffi::c_void {
+    match Context::new() {
+        Ok(ctx) => Ref::into_raw(ctx) as *mut core::ffi::c_void,
+        Err(_err) => return core::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+unsafe extern "C" fn rust_binder_put_device(device: *mut core::ffi::c_void) {
+    if !device.is_null() {
+        // SAFETY: The caller ensures that the pointer is valid.
+        unsafe {
+            let ctx: Ref<Context> = Ref::from_raw(device.cast());
+            drop(ctx);
+        }
+    }
+}
+
+unsafe extern "C" fn rust_binder_open(inode: *mut bindings::inode, file: *mut bindings::file) -> core::ffi::c_int {
+    // SAFETY: The `rust_binderfs.c` file ensures that `i_private` is set to the return value of a
+    // successful call to `rust_binder_new_device`. Here we use `ManuallyDrop` to avoid dropping
+    // the ref-count when `ctx` goes out of scope, as we are only borrowing the context here.
+    let ctx: ManuallyDrop<Ref<Context>> = unsafe {
+        ManuallyDrop::new(Ref::from_raw((*inode).i_private.cast()))
+    };
+
+    let process = match Process::open(&*ctx, unsafe { File::from_ptr(file) }) {
+        Ok(process) => process,
+        Err(err) => return err.to_kernel_errno(),
+    };
+
+    unsafe { (*file).private_data = process.into_pointer() as *mut core::ffi::c_void; }
+
+    0
+}
+
+unsafe extern "C" fn rust_binder_release(_inode: *mut bindings::inode, file: *mut bindings::file) -> core::ffi::c_int {
+    let process: Ref<Process> = unsafe { Ref::from_pointer((*file).private_data) };
+    let file = unsafe { File::from_ptr(file) };
+    Process::release(process, file);
+    0
+}
+
+unsafe extern "C" fn rust_binder_compat_ioctl(
+    file: *mut bindings::file,
+    cmd: core::ffi::c_uint,
+    arg: core::ffi::c_ulong,
+) -> core::ffi::c_long {
+    let f = unsafe { Ref::borrow((*file).private_data) };
+    let mut cmd = kernel::file::IoctlCommand::new(cmd as _, arg as _);
+    match Process::compat_ioctl(f, unsafe { File::from_ptr(file) }, &mut cmd) {
+        Ok(ret) => ret.into(),
+        Err(err) => err.to_kernel_errno().into(),
+    }
+}
+
+unsafe extern "C" fn rust_binder_unlocked_ioctl(
+    file: *mut bindings::file,
+    cmd: core::ffi::c_uint,
+    arg: core::ffi::c_ulong,
+) -> core::ffi::c_long {
+    let f = unsafe { Ref::borrow((*file).private_data) };
+    let mut cmd = kernel::file::IoctlCommand::new(cmd as _, arg as _);
+    match Process::ioctl(f, unsafe { File::from_ptr(file) }, &mut cmd) {
+        Ok(ret) => ret.into(),
+        Err(err) => err.to_kernel_errno().into(),
+    }
+}
+
+unsafe extern "C" fn rust_binder_mmap(
+    file: *mut bindings::file,
+    vma: *mut bindings::vm_area_struct,
+) -> core::ffi::c_int {
+    let f = unsafe { Ref::borrow((*file).private_data) };
+    let mut area = unsafe { kernel::mm::virt::Area::from_ptr(vma) };
+    match Process::mmap(f, unsafe { File::from_ptr(file) }, &mut area) {
+        Ok(()) => 0,
+        Err(err) => err.to_kernel_errno().into(),
+    }
+}
+
+unsafe extern "C" fn rust_binder_poll(
+    file: *mut bindings::file,
+    wait: *mut bindings::poll_table_struct,
+) -> bindings::__poll_t {
+    let f = unsafe { Ref::borrow((*file).private_data) };
+    let fileref = unsafe { File::from_ptr(file) };
+    match Process::poll(f, fileref, unsafe {
+        &PollTable::from_ptr(wait)
+    }) {
+        Ok(v) => v,
+        Err(_) => bindings::POLLERR,
     }
 }

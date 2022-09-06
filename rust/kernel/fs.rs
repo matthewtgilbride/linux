@@ -560,6 +560,15 @@ pub struct SuperParams {
 
     /// Granularity of c/m/atime in ns (cannot be worse than a second).
     pub time_gran: u32,
+
+    /// The bits in `s_iflags` to set.
+    ///
+    /// This field has a non-zero default value, so we provide a way to both set and unset bits
+    /// compared to the default.
+    pub iflags_set: u64,
+
+    /// The bits in `s_iflags` to unset.
+    pub iflags_unset: u64,
 }
 
 impl SuperParams {
@@ -569,6 +578,8 @@ impl SuperParams {
         blocksize_bits: crate::PAGE_SIZE as _,
         maxbytes: bindings::MAX_LFS_FILESIZE,
         time_gran: 1,
+        iflags_set: 0,
+        iflags_unset: 0,
     };
 }
 
@@ -614,6 +625,8 @@ impl<'a, T: Type + ?Sized> NewSuperBlock<'a, T, NeedsInit> {
         sb.s_time_gran = params.time_gran;
         sb.s_blocksize_bits = params.blocksize_bits;
         sb.s_blocksize = 1;
+        sb.s_iflags &= !params.iflags_unset;
+        sb.s_iflags |= params.iflags_set;
         if sb.s_blocksize.leading_zeros() < params.blocksize_bits.into() {
             return Err(EINVAL);
         }
@@ -690,7 +703,7 @@ impl<'a, T: Type + ?Sized> NewSuperBlock<'a, T, NeedsRoot> {
 
         // SAFETY: The typestate guarantees that `self.sb` is initialised and we just finished
         // setting its root, so it's a fully ready superblock.
-        Ok(unsafe { &mut *self.sb.cast() })
+        Ok(unsafe { &*self.sb.cast() })
     }
 }
 

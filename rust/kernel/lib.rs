@@ -154,6 +154,11 @@ impl ThisModule {
         ThisModule(ptr)
     }
 
+    /// Returns a raw pointer to the module.
+    pub const fn as_ptr(&self) -> *mut bindings::module {
+        self.0
+    }
+
     /// Locks the module parameters to access them.
     ///
     /// Returns a [`KParamGuard`] that will release the lock when dropped.

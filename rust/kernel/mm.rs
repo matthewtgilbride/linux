@@ -28,7 +28,7 @@ pub mod virt {
         ///
         /// Callers must ensure that `vma` is non-null and valid for the duration of the new area's
         /// lifetime.
-        pub(crate) unsafe fn from_ptr(vma: *mut bindings::vm_area_struct) -> Self {
+        pub unsafe fn from_ptr(vma: *mut bindings::vm_area_struct) -> Self {
             // INVARIANTS: The safety requirements guarantee the invariants.
             Self { vma }
         }

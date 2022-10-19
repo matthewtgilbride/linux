@@ -27,6 +27,7 @@
 #include <linux/netfilter_ipv4.h>
 #include <linux/netfilter_ipv6.h>
 #include <linux/of_platform.h>
+#include <linux/pid_namespace.h>
 #include <linux/platform_device.h>
 #include <linux/poll.h>
 #include <linux/random.h>
@@ -34,6 +35,7 @@
 #include <linux/slab.h>
 #include <linux/sysctl.h>
 #include <linux/uaccess.h>
+#include <linux/uidgid.h>
 #include <linux/uio.h>
 #include <uapi/linux/android/binder.h>
 #include <linux/fs_parser.h>

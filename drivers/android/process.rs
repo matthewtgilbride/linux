@@ -288,6 +288,10 @@ impl Process {
         Ok(process.into())
     }
 
+    pub(crate) fn is_dead(&self) -> bool {
+        self.inner.lock().is_dead
+    }
+
     /// Attempts to fetch a work item from the process queue.
     pub(crate) fn get_work(&self) -> Option<Ref<dyn DeliverToRead>> {
         self.inner.lock().work.pop_front()

@@ -9,6 +9,7 @@ use kernel::{
     linked_list::{GetLinks, Links},
     prelude::*,
     sync::{Ref, SpinLock, UniqueRef},
+    task::Kuid,
     user_ptr::UserSlicePtrWriter,
     Either, ScopeGuard,
 };
@@ -40,6 +41,7 @@ pub(crate) struct Transaction {
     offsets_size: usize,
     data_address: usize,
     links: Links<dyn DeliverToRead>,
+    sender_euid: Kuid,
 }
 
 impl Transaction {
@@ -70,6 +72,7 @@ impl Transaction {
             offsets_size: trd.offsets_size as _,
             links: Links::new(),
             free_allocation: AtomicBool::new(true),
+            sender_euid: from.process.task.euid(),
         })?);
 
         // SAFETY: `inner` is pinned when `tr` is.
@@ -104,6 +107,7 @@ impl Transaction {
             offsets_size: trd.offsets_size as _,
             links: Links::new(),
             free_allocation: AtomicBool::new(true),
+            sender_euid: from.process.task.euid(),
         })?);
 
         // SAFETY: `inner` is pinned when `tr` is.
@@ -198,10 +202,6 @@ impl Transaction {
 
 impl DeliverToRead for Transaction {
     fn do_work(self: Ref<Self>, thread: &Thread, writer: &mut UserSlicePtrWriter) -> Result<bool> {
-        /* TODO: Initialise the following fields from tr:
-            pub sender_pid: pid_t,
-            pub sender_euid: uid_t,
-        */
         let send_failed_reply = ScopeGuard::new(|| {
             if self.node_ref.is_some() && self.flags & TF_ONE_WAY == 0 {
                 let reply = Either::Right(BR_FAILED_REPLY);
@@ -231,6 +231,17 @@ impl DeliverToRead for Transaction {
         tr.offsets_size = self.offsets_size as _;
         if tr.offsets_size > 0 {
             tr.data.ptr.offsets = (self.data_address + ptr_align(self.data_size)) as _;
+        }
+
+        tr.sender_euid = self.sender_euid.into_uid_in_current_ns();
+
+        tr.sender_pid = 0;
+        if self.node_ref.is_some() && self.flags & TF_ONE_WAY == 0 {
+            // Not a reply and not one-way.
+            let from_proc = &*self.from.process;
+            if !from_proc.is_dead() {
+                tr.sender_pid = from_proc.task.pid_in_current_ns();
+            }
         }
 
         let code = if self.node_ref.is_none() {

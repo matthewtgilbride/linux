@@ -42,6 +42,7 @@ pub(crate) struct Transaction {
     data_address: usize,
     links: Links<dyn DeliverToRead>,
     sender_euid: Kuid,
+    txn_security_ctx_off: Option<usize>,
 }
 
 impl Transaction {
@@ -53,8 +54,10 @@ impl Transaction {
     ) -> BinderResult<Ref<Self>> {
         let trd = &tr.transaction_data;
         let allow_fds = node_ref.node.flags & FLAT_BINDER_FLAG_ACCEPTS_FDS != 0;
+        let txn_security_ctx = node_ref.node.flags & FLAT_BINDER_FLAG_TXN_SECURITY_CTX != 0;
+        let mut txn_security_ctx_off = if txn_security_ctx { Some(0) } else { None };
         let to = node_ref.node.owner.clone();
-        let mut alloc = from.copy_transaction_data(&to, tr, allow_fds)?;
+        let mut alloc = from.copy_transaction_data(&to, tr, allow_fds, txn_security_ctx_off.as_mut())?;
         let data_address = alloc.ptr;
         let file_list = alloc.take_file_list();
         alloc.keep_alive();
@@ -73,6 +76,7 @@ impl Transaction {
             links: Links::new(),
             free_allocation: AtomicBool::new(true),
             sender_euid: from.process.task.euid(),
+            txn_security_ctx_off,
         })?);
 
         // SAFETY: `inner` is pinned when `tr` is.
@@ -89,7 +93,7 @@ impl Transaction {
         allow_fds: bool,
     ) -> BinderResult<Ref<Self>> {
         let trd = &tr.transaction_data;
-        let mut alloc = from.copy_transaction_data(&to, tr, allow_fds)?;
+        let mut alloc = from.copy_transaction_data(&to, tr, allow_fds, None)?;
         let data_address = alloc.ptr;
         let file_list = alloc.take_file_list();
         alloc.keep_alive();
@@ -108,6 +112,7 @@ impl Transaction {
             links: Links::new(),
             free_allocation: AtomicBool::new(true),
             sender_euid: from.process.task.euid(),
+            txn_security_ctx_off: None,
         })?);
 
         // SAFETY: `inner` is pinned when `tr` is.
@@ -216,7 +221,8 @@ impl DeliverToRead for Transaction {
             return Ok(true);
         };
 
-        let mut tr = BinderTransactionData::default();
+        let mut tr_sec = BinderTransactionDataSecctx::default();
+        let tr = tr_sec.tr_data();
 
         if let Some(nref) = &self.node_ref {
             let (ptr, cookie) = nref.node.get_id();
@@ -247,12 +253,21 @@ impl DeliverToRead for Transaction {
         let code = if self.node_ref.is_none() {
             BR_REPLY
         } else {
-            BR_TRANSACTION
+            if self.txn_security_ctx_off.is_some() {
+                BR_TRANSACTION_SEC_CTX
+            } else {
+                BR_TRANSACTION
+            }
         };
 
         // Write the transaction code and data to the user buffer.
         writer.write(&code)?;
-        writer.write(&tr)?;
+        if let Some(off) = self.txn_security_ctx_off {
+            tr_sec.secctx = (self.data_address + off) as u64;
+            writer.write(&tr_sec)?;
+        } else {
+            writer.write(&*tr)?;
+        }
 
         // Dismiss the completion of transaction with a failure. No failure paths are allowed from
         // here on out.
@@ -281,7 +296,7 @@ impl DeliverToRead for Transaction {
 
         // When this is not a reply and not an async transaction, update `current_transaction`. If
         // it's a reply, `current_transaction` has already been updated appropriately.
-        if self.node_ref.is_some() && tr.flags & TF_ONE_WAY == 0 {
+        if self.node_ref.is_some() && tr_sec.transaction_data.flags & TF_ONE_WAY == 0 {
             thread.set_current_transaction(self);
         }
 

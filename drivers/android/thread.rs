@@ -801,8 +801,16 @@ impl Thread {
         to_process: &'a Process,
         tr: &BinderTransactionDataSg,
         allow_fds: bool,
+        txn_security_ctx_offset: Option<&mut usize>,
     ) -> BinderResult<Allocation<'a>> {
         let trd = &tr.transaction_data;
+
+        let mut secctx = if let Some(offset) = txn_security_ctx_offset {
+            let secid = self.process.cred.get_secid();
+            Some((offset, security::SecurityCtx::from_secid(secid)?))
+        } else {
+            None
+        };
 
         let data_size = trd.data_size.try_into().map_err(|_| EINVAL)?;
         let adata_size = ptr_align(data_size);
@@ -810,15 +818,18 @@ impl Thread {
         let aoffsets_size = ptr_align(offsets_size);
         let buffers_size = tr.buffers_size.try_into().map_err(|_| EINVAL)?;
         let abuffers_size = ptr_align(buffers_size);
+        let asecctx_size = secctx.as_ref().map(|(_, ctx)| ptr_align(ctx.len())).unwrap_or(0);
 
         // This guarantees that at least `sizeof(usize)` bytes will be allocated.
         let len = core::cmp::max(
             adata_size
                 .checked_add(aoffsets_size)
                 .and_then(|sum| sum.checked_add(abuffers_size))
+                .and_then(|sum| sum.checked_add(asecctx_size))
                 .ok_or(ENOMEM)?,
             size_of::<usize>(),
         );
+        let secctx_off = adata_size + aoffsets_size + abuffers_size;
         let mut alloc = to_process.buffer_alloc(len)?;
 
         let mut buffer_reader =
@@ -898,6 +909,11 @@ impl Thread {
 
         if let Some(sg_state) = sg_state.as_mut() {
             self.apply_sg(&mut alloc, sg_state)?;
+        }
+
+        if let Some((off_out, secctx)) = secctx.as_mut() {
+            alloc.write(secctx_off, secctx.as_bytes())?;
+            **off_out = secctx_off;
         }
 
         Ok(alloc)

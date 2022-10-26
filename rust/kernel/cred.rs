@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
+//
 
 //! Credentials management.
 //!
@@ -29,6 +30,16 @@ impl Credential {
         // SAFETY: The safety requirements guarantee the validity of the dereference, while the
         // `Credential` type being transparent makes the cast ok.
         unsafe { &*ptr.cast() }
+    }
+
+    /// Get the id for this security context.
+    pub fn get_secid(&self) -> u32 {
+        let mut secid = 0;
+        // SAFETY: The invariants of this type ensures that the pointer is valid.
+        unsafe {
+            bindings::security_cred_getsecid(self.0.get(), &mut secid);
+        }
+        secid
     }
 }
 

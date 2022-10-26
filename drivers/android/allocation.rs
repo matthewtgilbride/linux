@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 
-use core::mem::{replace, size_of, MaybeUninit};
+use core::mem::{replace, size_of, size_of_val, MaybeUninit};
 use kernel::{
     bindings, linked_list::List, pages::Pages, prelude::*, sync::Ref, user_ptr::UserSlicePtrReader,
 };
@@ -103,9 +103,9 @@ impl<'a> Allocation<'a> {
         Ok(unsafe { out.assume_init() })
     }
 
-    pub(crate) fn write<T>(&self, offset: usize, obj: &T) -> Result {
+    pub(crate) fn write<T: ?Sized>(&self, offset: usize, obj: &T) -> Result {
         let mut obj_offset = 0;
-        self.iterate(offset, size_of::<T>(), |page, offset, to_copy| {
+        self.iterate(offset, size_of_val(obj), |page, offset, to_copy| {
             // SAFETY: The sum of `offset` and `to_copy` is bounded by the size of T.
             let obj_ptr = unsafe { (obj as *const T as *const u8).add(obj_offset) };
             // SAFETY: We have a reference to the object, so the pointer is valid.

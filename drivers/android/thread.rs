@@ -253,6 +253,9 @@ struct InnerThread {
     /// prefixed with `LOOPER_`.
     looper_flags: u32,
 
+    /// Determines whether the looper should return.
+    looper_need_return: bool,
+
     /// Determines if thread is dead.
     is_dead: bool,
 
@@ -277,6 +280,7 @@ impl InnerThread {
     fn new() -> Self {
         Self {
             looper_flags: 0,
+            looper_need_return: false,
             is_dead: false,
             process_work_list: false,
             work_list: List::new(),
@@ -458,25 +462,29 @@ impl Thread {
     /// Attempts to fetch a work item from the thread-local queue. The behaviour if the queue is
     /// empty depends on `wait`: if it is true, the function waits for some work to be queued (or a
     /// signal); otherwise it returns indicating that none is available.
-    fn get_work_local(self: &Ref<Self>, wait: bool) -> Result<Ref<dyn DeliverToRead>> {
+    fn get_work_local(self: &Ref<Self>, wait: bool) -> Result<Option<Ref<dyn DeliverToRead>>> {
         // Try once if the caller does not want to wait.
         if !wait {
-            return self.inner.lock().pop_work().ok_or(EAGAIN);
+            return self.inner.lock().pop_work().ok_or(EAGAIN).map(Some);
         }
 
         // Loop waiting only on the local queue (i.e., not registering with the process queue).
         let mut inner = self.inner.lock();
         loop {
             if let Some(work) = inner.pop_work() {
-                return Ok(work);
+                return Ok(Some(work));
             }
 
             inner.looper_flags |= LOOPER_WAITING;
+            inner.looper_need_return = false;
             let signal_pending = self.work_condvar.wait(&mut inner);
             inner.looper_flags &= !LOOPER_WAITING;
 
             if signal_pending {
                 return Err(ERESTARTSYS);
+            }
+            if inner.looper_need_return {
+                return Ok(None);
             }
         }
     }
@@ -486,12 +494,12 @@ impl Thread {
     ///
     /// This must only be called when the thread is not participating in a transaction chain. If it
     /// is, the local version (`get_work_local`) should be used instead.
-    fn get_work(self: &Ref<Self>, wait: bool) -> Result<Ref<dyn DeliverToRead>> {
+    fn get_work(self: &Ref<Self>, wait: bool) -> Result<Option<Ref<dyn DeliverToRead>>> {
         // Try to get work from the thread's work queue, using only a local lock.
         {
             let mut inner = self.inner.lock();
             if let Some(work) = inner.pop_work() {
-                return Ok(work);
+                return Ok(Some(work));
             }
         }
 
@@ -500,22 +508,23 @@ impl Thread {
         // We know nothing will have been queued directly to the thread queue because it is not in
         // a transaction and it is not in the process' ready list.
         if !wait {
-            return self.process.get_work().ok_or(EAGAIN);
+            return self.process.get_work().ok_or(EAGAIN).map(Some);
         }
 
         // Get work from the process queue. If none is available, atomically register as ready.
         let reg = match self.process.get_work_or_register(self) {
-            Either::Left(work) => return Ok(work),
+            Either::Left(work) => return Ok(Some(work)),
             Either::Right(reg) => reg,
         };
 
         let mut inner = self.inner.lock();
         loop {
             if let Some(work) = inner.pop_work() {
-                return Ok(work);
+                return Ok(Some(work));
             }
 
             inner.looper_flags |= LOOPER_WAITING;
+            inner.looper_need_return = false;
             let signal_pending = self.work_condvar.wait(&mut inner);
             inner.looper_flags &= !LOOPER_WAITING;
 
@@ -526,7 +535,12 @@ impl Thread {
                 // error).
                 drop(inner);
                 drop(reg);
-                return self.inner.lock().pop_work().ok_or(ERESTARTSYS);
+                return self.inner.lock().pop_work().ok_or(ERESTARTSYS).map(Some);
+            }
+            if inner.looper_need_return {
+                drop(inner);
+                drop(reg);
+                return Ok(None);
             }
         }
     }
@@ -1212,10 +1226,13 @@ impl Thread {
         let initial_len = writer.len();
         while writer.len() >= size_of::<u32>() {
             match getter(self, wait && initial_len == writer.len()) {
-                Ok(work) => {
+                Ok(Some(work)) => {
                     if !work.do_work(self, &mut writer)? {
                         break;
                     }
+                }
+                Ok(None) => {
+                    break;
                 }
                 Err(err) => {
                     // Propagate the error if we haven't written anything else.
@@ -1278,6 +1295,19 @@ impl Thread {
         (inner.should_use_process_work_queue(), inner.poll())
     }
 
+    pub(crate) fn notify_flush(&self) {
+        let mut inner = self.inner.lock();
+        let notify = inner.looper_flags & LOOPER_WAITING != 0;
+        if notify {
+            inner.looper_need_return = true;
+        }
+        drop(inner);
+
+        if notify {
+            self.work_condvar.notify_one();
+        }
+    }
+
     pub(crate) fn notify_if_poll_ready(&self) {
         // Determine if we need to notify. This requires the lock.
         let inner = self.inner.lock();
@@ -1301,7 +1331,7 @@ impl Thread {
         self.inner.lock().is_dead = true;
 
         // Cancel all pending work items.
-        while let Ok(work) = self.get_work_local(false) {
+        while let Ok(Some(work)) = self.get_work_local(false) {
             work.cancel();
         }
 

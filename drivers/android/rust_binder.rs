@@ -158,7 +158,7 @@ pub static rust_binder_fops: AssertSync<kernel::bindings::file_operations> = {
         iterate: None,
         iterate_shared: None,
         mmap_supported_flags: 0,
-        flush: None,
+        flush: Some(rust_binder_flush),
         fsync: None,
         fasync: None,
         lock: None,
@@ -273,5 +273,16 @@ unsafe extern "C" fn rust_binder_poll(
     }) {
         Ok(v) => v,
         Err(_) => bindings::POLLERR,
+    }
+}
+
+unsafe extern "C" fn rust_binder_flush(
+    file: *mut bindings::file,
+    _id: bindings::fl_owner_t,
+) -> core::ffi::c_int {
+    let f = unsafe { Ref::borrow((*file).private_data) };
+    match Process::flush(f) {
+        Ok(()) => 0,
+        Err(err) => err.to_kernel_errno().into(),
     }
 }

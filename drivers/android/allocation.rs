@@ -44,6 +44,18 @@ impl<'a> Allocation<'a> {
         }
     }
 
+    pub(crate) fn new_zerod(
+        process: &'a Process,
+        offset: usize,
+        size: usize,
+        ptr: usize,
+        pages: Ref<[Pages<0>]>,
+    ) -> Result<Self> {
+        let me = Self::new(process, offset, size, ptr, pages);
+        me.fill_zero()?;
+        Ok(me)
+    }
+
     pub(crate) fn take_file_list(&mut self) -> List<Box<FileInfo>> {
         replace(&mut self.file_list, List::new())
     }
@@ -112,6 +124,12 @@ impl<'a> Allocation<'a> {
             unsafe { page.write(obj_ptr, offset, to_copy) }?;
             obj_offset += to_copy;
             Ok(())
+        })
+    }
+
+    pub(crate) fn fill_zero(&self) -> Result {
+        self.iterate(0, self.size, |page, offset, len| {
+            unsafe { page.fill_zero(offset, len) }
         })
     }
 

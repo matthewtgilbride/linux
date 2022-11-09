@@ -533,13 +533,13 @@ impl Process {
         let mapping = inner.mapping.as_mut().ok_or_else(BinderError::new_dead)?;
 
         let offset = mapping.alloc.reserve_new(size)?;
-        Ok(Allocation::new(
+        Ok(Allocation::new_zerod(
             self,
             offset,
             size,
             mapping.address + offset,
             mapping.pages.clone(),
-        ))
+        )?)
     }
 
     // TODO: Review if we want an Option or a Result.

@@ -767,6 +767,14 @@ impl Process {
             death.set_notification_done(thread);
         }
     }
+
+    pub(crate) fn flush(this: RefBorrow<'_, Process>) -> Result {
+        let inner = this.inner.lock();
+        for thread in inner.threads.values() {
+            thread.notify_flush();
+        }
+        Ok(())
+    }
 }
 
 impl IoctlHandler for Process {

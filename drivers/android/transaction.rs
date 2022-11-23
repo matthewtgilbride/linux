@@ -317,8 +317,11 @@ impl DeliverToRead for Transaction {
     }
 
     fn cancel(self: Ref<Self>) {
-        let reply = Either::Right(BR_DEAD_REPLY);
-        self.from.deliver_reply(reply, &self);
+        // If this is not a reply or oneway transaction, then send a dead reply.
+        if self.node_ref.is_some() && self.flags & TF_ONE_WAY == 0 {
+            let reply = Either::Right(BR_DEAD_REPLY);
+            self.from.deliver_reply(reply, &self);
+        }
     }
 
     fn get_links(&self) -> &Links<dyn DeliverToRead> {

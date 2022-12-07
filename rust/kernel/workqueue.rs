@@ -63,6 +63,7 @@ macro_rules! impl_work_adapter {
     ($adapter:ty, $work_type:ty, $field:ident, $closure:expr) => {
         // SAFETY: We use `offset_of` to ensure that the field is within the given type, and we
         // also check its type is `Work`.
+        #[allow(unreachable_code)]
         unsafe impl $crate::workqueue::WorkAdapter for $adapter {
             type Target = $work_type;
             const FIELD_OFFSET: isize = $crate::offset_of!(Self::Target, $field);

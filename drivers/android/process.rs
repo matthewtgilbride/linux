@@ -14,6 +14,7 @@ use kernel::{
     sync::{Guard, Mutex, Ref, RefBorrow, UniqueRef},
     task::Task,
     user_ptr::{UserSlicePtr, UserSlicePtrReader},
+    workqueue::{self, Work},
     Either,
 };
 
@@ -52,6 +53,9 @@ impl Mapping {
     }
 }
 
+const PROC_DEFER_FLUSH: u8 = 1;
+const PROC_DEFER_RELEASE: u8 = 2;
+
 // TODO: Make this private.
 pub(crate) struct ProcessInner {
     is_manager: bool,
@@ -72,6 +76,9 @@ pub(crate) struct ProcessInner {
 
     /// The number of threads the started and registered with the thread pool.
     started_thread_count: u32,
+
+    /// Bitmap of deferred work to do.
+    defer_work: u8,
 }
 
 impl ProcessInner {
@@ -88,6 +95,7 @@ impl ProcessInner {
             max_threads: 0,
             started_thread_count: 0,
             delivered_deaths: List::new(),
+            defer_work: 0,
         }
     }
 
@@ -259,7 +267,12 @@ pub(crate) struct Process {
     // References are in a different mutex to avoid recursive acquisition when
     // incrementing/decrementing a node in another process.
     node_refs: Mutex<ProcessNodeRefs>,
+
+    // Work node for deferred work item.
+    defer_work: Work,
 }
+
+kernel::impl_self_work_adapter!(Process, defer_work, Process::run_deferred);
 
 #[allow(clippy::non_send_fields_in_send_ty)]
 unsafe impl Send for Process {}
@@ -267,7 +280,7 @@ unsafe impl Sync for Process {}
 
 impl Process {
     fn new(ctx: Ref<Context>, cred: ARef<Credential>) -> Result<Ref<Self>> {
-        let mut process = Pin::from(UniqueRef::try_new(Self {
+        let process = UniqueRef::try_new(Self {
             ctx,
             cred,
             task: Task::current().group_leader().into(),
@@ -275,7 +288,12 @@ impl Process {
             inner: unsafe { Mutex::new(ProcessInner::new()) },
             // SAFETY: `node_refs` is initialised in the call to `mutex_init` below.
             node_refs: unsafe { Mutex::new(ProcessNodeRefs::new()) },
-        })?);
+            // SAFETY: `node_refs` is initialised in the call to `init_work_item` below.
+            defer_work: unsafe { Work::new() },
+        })?;
+        kernel::init_work_item!(&process);
+
+        let mut process = Pin::from(process);
 
         // SAFETY: `inner` is pinned when `Process` is.
         let pinned = unsafe { process.as_mut().map_unchecked_mut(|p| &mut p.inner) };
@@ -769,11 +787,115 @@ impl Process {
     }
 
     pub(crate) fn flush(this: RefBorrow<'_, Process>) -> Result {
-        let inner = this.inner.lock();
+        let should_schedule;
+        {
+            let mut inner = this.inner.lock();
+            should_schedule = inner.defer_work == 0;
+            inner.defer_work |= PROC_DEFER_FLUSH;
+        }
+
+        if should_schedule {
+            workqueue::system().enqueue(Ref::from(this));
+        }
+
+        Ok(())
+    }
+
+    fn deferred_flush(&self) {
+        let inner = self.inner.lock();
         for thread in inner.threads.values() {
             thread.notify_flush();
         }
-        Ok(())
+    }
+
+    fn deferred_release(self: Ref<Self>) {
+        // Mark this process as dead. We'll do the same for the threads later.
+        self.inner.lock().is_dead = true;
+
+        // If this process is the manager, unset it.
+        if self.inner.lock().is_manager {
+            self.ctx.unset_manager_node();
+        }
+
+        // Cancel all pending work items.
+        while let Some(work) = self.get_work() {
+            work.cancel();
+        }
+
+        // Free any resources kept alive by allocated buffers.
+        let omapping = self.inner.lock().mapping.take();
+        if let Some(mut mapping) = omapping {
+            let address = mapping.address;
+            let pages = mapping.pages.clone();
+            mapping.alloc.for_each(|offset, size, odata| {
+                let ptr = offset + address;
+                let mut alloc = Allocation::new(&self, offset, size, ptr, pages.clone());
+                if let Some(data) = odata {
+                    alloc.set_info(data);
+                }
+                drop(alloc)
+            });
+        }
+
+        // Drop all references. We do this dance with `swap` to avoid destroying the references
+        // while holding the lock.
+        let mut refs = self.node_refs.lock();
+        let mut node_refs = take(&mut refs.by_handle);
+        drop(refs);
+
+        // Remove all death notifications from the nodes (that belong to a different process).
+        for info in node_refs.values_mut() {
+            let death = if let Some(existing) = info.death.take() {
+                existing
+            } else {
+                continue;
+            };
+
+            death.set_cleared(false);
+        }
+
+        // Do similar dance for the state lock.
+        let mut inner = self.inner.lock();
+        let threads = take(&mut inner.threads);
+        let nodes = take(&mut inner.nodes);
+        drop(inner);
+
+        // Release all threads.
+        for thread in threads.values() {
+            thread.release();
+        }
+
+        // Deliver death notifications.
+        for node in nodes.values() {
+            loop {
+                let death = {
+                    let mut inner = self.inner.lock();
+                    if let Some(death) = node.next_death(&mut inner) {
+                        death
+                    } else {
+                        break;
+                    }
+                };
+
+                death.set_dead();
+            }
+        }
+    }
+
+    pub(crate) fn run_deferred(self: Ref<Self>) {
+        let defer;
+        {
+            let mut inner = self.inner.lock();
+            defer = inner.defer_work;
+            inner.defer_work = 0;
+        }
+
+        if defer & PROC_DEFER_FLUSH != 0 {
+            self.deferred_flush();
+        }
+        if defer & PROC_DEFER_RELEASE != 0 {
+            self.deferred_release();
+        }
     }
 }
 
@@ -828,79 +950,16 @@ impl file::Operations for Process {
         Self::new(ctx.clone(), file.cred().into())
     }
 
-    fn release(obj: Self::Data, _file: &File) {
-        // Mark this process as dead. We'll do the same for the threads later.
-        obj.inner.lock().is_dead = true;
-
-        // If this process is the manager, unset it.
-        if obj.inner.lock().is_manager {
-            obj.ctx.unset_manager_node();
+    fn release(this: Self::Data, _file: &File) {
+        let should_schedule;
+        {
+            let mut inner = this.inner.lock();
+            should_schedule = inner.defer_work == 0;
+            inner.defer_work |= PROC_DEFER_RELEASE;
         }
 
-        // TODO: Do this in a worker?
-
-        // Cancel all pending work items.
-        while let Some(work) = obj.get_work() {
-            work.cancel();
-        }
-
-        // Free any resources kept alive by allocated buffers.
-        let omapping = obj.inner.lock().mapping.take();
-        if let Some(mut mapping) = omapping {
-            let address = mapping.address;
-            let pages = mapping.pages.clone();
-            mapping.alloc.for_each(|offset, size, odata| {
-                let ptr = offset + address;
-                let mut alloc = Allocation::new(&obj, offset, size, ptr, pages.clone());
-                if let Some(data) = odata {
-                    alloc.set_info(data);
-                }
-                drop(alloc)
-            });
-        }
-
-        // Drop all references. We do this dance with `swap` to avoid destroying the references
-        // while holding the lock.
-        let mut refs = obj.node_refs.lock();
-        let mut node_refs = take(&mut refs.by_handle);
-        drop(refs);
-
-        // Remove all death notifications from the nodes (that belong to a different process).
-        for info in node_refs.values_mut() {
-            let death = if let Some(existing) = info.death.take() {
-                existing
-            } else {
-                continue;
-            };
-
-            death.set_cleared(false);
-        }
-
-        // Do similar dance for the state lock.
-        let mut inner = obj.inner.lock();
-        let threads = take(&mut inner.threads);
-        let nodes = take(&mut inner.nodes);
-        drop(inner);
-
-        // Release all threads.
-        for thread in threads.values() {
-            thread.release();
-        }
-
-        // Deliver death notifications.
-        for node in nodes.values() {
-            loop {
-                let death = {
-                    let mut inner = obj.inner.lock();
-                    if let Some(death) = node.next_death(&mut inner) {
-                        death
-                    } else {
-                        break;
-                    }
-                };
-
-                death.set_dead();
-            }
+        if should_schedule {
+            workqueue::system().enqueue(this.clone());
         }
     }
 

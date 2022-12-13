@@ -52,6 +52,11 @@ trait DeliverToRead {
 
     /// Returns the linked list links for the work item.
     fn get_links(&self) -> &Links<dyn DeliverToRead>;
+
+    /// Get the debug name of this type.
+    fn debug_name(&self) -> &'static str {
+        core::any::type_name::<Self>()
+    }
 }
 
 struct DeliverToReadListAdapter {}

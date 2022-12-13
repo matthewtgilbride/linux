@@ -333,13 +333,14 @@ impl InnerThread {
         ret
     }
 
-    fn push_work_deferred(&mut self, work: Ref<dyn DeliverToRead>) {
-        self.work_list.push_back(work);
+    fn push_work_deferred(&mut self, work: Ref<dyn DeliverToRead>) -> bool {
+        self.work_list.push_back(work)
     }
 
-    fn push_work(&mut self, work: Ref<dyn DeliverToRead>) {
-        self.push_work_deferred(work);
-        self.process_work_list = true;
+    fn push_work(&mut self, work: Ref<dyn DeliverToRead>) -> bool {
+        let success = self.work_list.push_back(work);
+        self.process_work_list |= success;
+        success
     }
 
     fn has_work(&self) -> bool {
@@ -545,16 +546,23 @@ impl Thread {
         }
     }
 
-    pub(crate) fn push_work(&self, work: Ref<dyn DeliverToRead>) -> BinderResult {
+    pub(crate) fn push_work(&self, work: Ref<dyn DeliverToRead>) -> BinderResult<bool> {
         {
             let mut inner = self.inner.lock();
             if inner.is_dead {
                 return Err(BinderError::new_dead());
             }
-            inner.push_work(work);
+            let ty_name = work.debug_name();
+            if !inner.push_work(work) {
+                return Ok(false);
+            }
+            if inner.work_list.is_empty() {
+                pr_warn!("Failure: work_list empty after pushing {}", ty_name);
+                return Ok(false);
+            }
         }
         self.work_condvar.notify_one();
-        Ok(())
+        Ok(true)
     }
 
     /// Attempts to push to given work item to the thread if it's a looper thread (i.e., if it's
@@ -1029,7 +1037,7 @@ impl Thread {
             }
 
             match reply {
-                Either::Left(work) => inner.push_work(work),
+                Either::Left(work) => { inner.push_work(work); },
                 Either::Right(code) => inner.push_reply_work(code),
             }
         }

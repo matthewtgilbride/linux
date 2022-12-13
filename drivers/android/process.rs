@@ -104,7 +104,15 @@ impl ProcessInner {
         if let Some(thread) = self.ready_threads.pop_front() {
             // Push to thread while holding state lock. This prevents the thread from giving up
             // (for example, because of a signal) when we're about to deliver work.
-            thread.push_work(work)
+            match thread.push_work(work) {
+                Ok(success) => {
+                    if !success {
+                        self.ready_threads.push_back(thread);
+                    }
+                    Ok(())
+                },
+                Err(err) => Err(err),
+            }
         } else if self.is_dead {
             Err(BinderError::new_dead())
         } else {

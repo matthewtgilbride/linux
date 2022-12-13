@@ -130,15 +130,18 @@ impl<G: GetLinksWrapped> List<G> {
     ///
     /// It is dropped if it's already on this (or another) list; this can happen for
     /// reference-counted objects, so dropping means decrementing the reference count.
-    pub fn push_back(&mut self, data: G::Wrapped) {
+    pub fn push_back(&mut self, data: G::Wrapped) -> bool {
         let ptr = data.into_pointer();
 
+        let success = unsafe { self.list.push_back(ptr.as_ref()) };
         // SAFETY: We took ownership of the entry, so it is safe to insert it.
-        if !unsafe { self.list.push_back(ptr.as_ref()) } {
+        if !success {
             // If insertion failed, rebuild object so that it can be freed.
             // SAFETY: We just called `into_pointer` above.
             unsafe { G::Wrapped::from_pointer(ptr) };
         }
+
+        success
     }
 
     /// Inserts the given object after `existing`.

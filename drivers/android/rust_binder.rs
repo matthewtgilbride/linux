@@ -21,6 +21,9 @@ use kernel::miscdev::Registration;
 
 use core::mem::ManuallyDrop;
 
+#[macro_use]
+mod debug;
+
 mod allocation;
 mod context;
 mod defs;
@@ -110,10 +113,6 @@ struct BinderModule {
     _reg: Pin<Box<Registration<Process>>>,
 }
 
-extern "C" {
-    fn init_rust_binderfs() -> core::ffi::c_int; 
-}
-
 #[cfg(not(CONFIG_ANDROID_BINDERFS_RUST))]
 impl kernel::Module for BinderModule {
     fn init(name: &'static CStr, _module: &'static kernel::ThisModule) -> Result<Self> {
@@ -130,7 +129,7 @@ impl kernel::Module for BinderModule {
 impl kernel::Module for BinderModule {
     fn init(_name: &'static CStr, _module: &'static kernel::ThisModule) -> Result<Self> {
         unsafe {
-            kernel::error::to_result(init_rust_binderfs())?;
+            kernel::error::to_result(bindings::init_rust_binderfs())?;
         }
 
         Ok(Self { })
@@ -186,19 +185,22 @@ pub static rust_binder_fops: AssertSync<kernel::bindings::file_operations> = {
 };
 
 #[no_mangle]
-unsafe extern "C" fn rust_binder_new_device() -> *mut core::ffi::c_void {
-    match Context::new() {
+unsafe extern "C" fn rust_binder_new_device(name: *const core::ffi::c_char) -> *mut core::ffi::c_void {
+    let name = unsafe { kernel::str::CStr::from_char_ptr(name) };
+
+    match Context::new(name) {
         Ok(ctx) => Ref::into_raw(ctx) as *mut core::ffi::c_void,
         Err(_err) => return core::ptr::null_mut(),
     }
 }
 
 #[no_mangle]
-unsafe extern "C" fn rust_binder_put_device(device: *mut core::ffi::c_void) {
+unsafe extern "C" fn rust_binder_remove_device(device: *mut core::ffi::c_void) {
     if !device.is_null() {
         // SAFETY: The caller ensures that the pointer is valid.
         unsafe {
             let ctx: Ref<Context> = Ref::from_raw(device.cast());
+            ctx.deregister();
             drop(ctx);
         }
     }

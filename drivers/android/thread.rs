@@ -247,6 +247,7 @@ const LOOPER_EXITED: u32 = 0x04;
 const LOOPER_INVALID: u32 = 0x08;
 const LOOPER_WAITING: u32 = 0x10;
 const LOOPER_POLL: u32 = 0x20;
+const LOOPER_WAITING_PROC: u32 = 0x40;
 
 struct InnerThread {
     /// Determines the looper state of the thread. It is a bit-wise combination of the constants
@@ -456,6 +457,64 @@ impl Thread {
         Ok(thread.into())
     }
 
+    pub(crate) fn debug_print(&self, m: &mut crate::debug::SeqFile) {
+        let looper_flags;
+        let looper_need_return;
+        let is_dead;
+        let has_work;
+        let process_work_list;
+        let has_current_transaction;
+        {
+            let inner = self.inner.lock();
+            looper_flags = inner.looper_flags;
+            looper_need_return = inner.looper_need_return;
+            is_dead = inner.is_dead;
+            has_work = !inner.work_list.is_empty();
+            process_work_list = inner.process_work_list;
+            has_current_transaction = inner.current_transaction.is_some();
+        }
+        seq_print!(m, "  tid: {}\n", self.id);
+        seq_print!(m, "  state:");
+        if is_dead {
+            seq_print!(m, " dead");
+        }
+        if has_current_transaction {
+            seq_print!(m, " has_transaction");
+        }
+        if looper_need_return {
+            seq_print!(m, " pending_flush_wakeup");
+        }
+        if has_work && process_work_list {
+            seq_print!(m, " has_work");
+        }
+        if has_work && !process_work_list {
+            seq_print!(m, " has_deferred_work");
+        }
+        if looper_flags & LOOPER_REGISTERED != 0 {
+            seq_print!(m, " registered");
+        }
+        if looper_flags & LOOPER_ENTERED != 0 {
+            seq_print!(m, " entered");
+        }
+        if looper_flags & LOOPER_EXITED != 0 {
+            seq_print!(m, " exited");
+        }
+        if looper_flags & LOOPER_INVALID != 0 {
+            seq_print!(m, " invalid");
+        }
+        if looper_flags & LOOPER_WAITING != 0 {
+            if looper_flags & LOOPER_WAITING_PROC != 0 {
+                seq_print!(m, " in_get_work");
+            } else {
+                seq_print!(m, " in_get_work_local");
+            }
+        }
+        if looper_flags & LOOPER_POLL != 0 {
+            seq_print!(m, " poll_is_initialized");
+        }
+        seq_print!(m, "\n");
+    }
+
     pub(crate) fn set_current_transaction(&self, transaction: Ref<Transaction>) {
         self.inner.lock().current_transaction = Some(transaction);
     }
@@ -524,10 +583,10 @@ impl Thread {
                 return Ok(Some(work));
             }
 
-            inner.looper_flags |= LOOPER_WAITING;
+            inner.looper_flags |= LOOPER_WAITING | LOOPER_WAITING_PROC;
             inner.looper_need_return = false;
             let signal_pending = self.work_condvar.wait(&mut inner);
-            inner.looper_flags &= !LOOPER_WAITING;
+            inner.looper_flags &= !(LOOPER_WAITING | LOOPER_WAITING_PROC);
 
             if signal_pending {
                 // A signal is pending. We need to pull the thread off the list, then check the

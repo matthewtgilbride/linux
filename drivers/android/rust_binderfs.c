@@ -20,6 +20,7 @@
 #include <linux/mount.h>
 #include <linux/fs_parser.h>
 #include <linux/radix-tree.h>
+#include <linux/rust_binder.h>
 #include <linux/sched.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
@@ -44,17 +45,26 @@
 /* Ensure that the initial ipc namespace always has devices available. */
 #define BINDERFS_MAX_MINOR_CAPPED (BINDERFS_MAX_MINOR - 4)
 
-char *rust_binder_devices_param = CONFIG_ANDROID_BINDER_DEVICES_RUST;
-module_param_named(rust_devices, rust_binder_devices_param, charp, 0444);
+/* === DEFINED IN RUST === */
+extern int rust_binder_stats_show(struct seq_file *m, void *unused);
+DEFINE_SHOW_ATTRIBUTE(rust_binder_stats);
 
-// This typedef is used for Rust binder driver instances. The driver object is
-// completely opaque from C and can only be accessed via calls into Rust, so we
-// use a typedef.
-typedef void *rust_binder_device;
+extern int rust_binder_state_show(struct seq_file *m, void *unused);
+DEFINE_SHOW_ATTRIBUTE(rust_binder_state);
+
+extern int rust_binder_transactions_show(struct seq_file *m, void *unused);
+DEFINE_SHOW_ATTRIBUTE(rust_binder_transactions);
+
+extern int rust_binder_transaction_log_show(struct seq_file *m, void *unused);
+DEFINE_SHOW_ATTRIBUTE(rust_binder_transaction_log);
 
 extern const struct file_operations rust_binder_fops;
-extern rust_binder_device rust_binder_new_device(void);
-extern void rust_binder_put_device(rust_binder_device device);
+extern rust_binder_device rust_binder_new_device(char *name);
+extern void rust_binder_remove_device(rust_binder_device device);
+/* === END DEFINED IN RUST === */
+
+char *rust_binder_devices_param = CONFIG_ANDROID_BINDER_DEVICES_RUST;
+module_param_named(rust_devices, rust_binder_devices_param, charp, 0444);
 
 static dev_t binderfs_dev;
 static DEFINE_MUTEX(binderfs_minors_mutex);
@@ -128,7 +138,7 @@ static int binderfs_binder_device_create(struct inode *ref_inode,
 {
 	int minor, ret;
 	struct dentry *dentry, *root;
-	rust_binder_device device;
+	rust_binder_device device = NULL;
 	char *name = NULL;
 	size_t name_len;
 	struct inode *inode = NULL;
@@ -157,7 +167,14 @@ static int binderfs_binder_device_create(struct inode *ref_inode,
 	mutex_unlock(&binderfs_minors_mutex);
 
 	ret = -ENOMEM;
-	device = rust_binder_new_device();
+	req->name[BINDERFS_MAX_NAME] = '\0'; /* NUL-terminate */
+	name_len = strlen(req->name);
+	/* Make sure to include terminating NUL byte */
+	name = kmemdup(req->name, name_len + 1, GFP_KERNEL);
+	if (!name)
+		goto err;
+
+	device = rust_binder_new_device(name);
 	if (!device)
 		goto err;
 
@@ -172,13 +189,6 @@ static int binderfs_binder_device_create(struct inode *ref_inode,
 	inode->i_fop = &rust_binder_fops;
 	inode->i_uid = info->root_uid;
 	inode->i_gid = info->root_gid;
-
-	req->name[BINDERFS_MAX_NAME] = '\0'; /* NUL-terminate */
-	name_len = strlen(req->name);
-	/* Make sure to include terminating NUL byte */
-	name = kmemdup(req->name, name_len + 1, GFP_KERNEL);
-	if (!name)
-		goto err;
 
 	req->major = MAJOR(binderfs_dev);
 	req->minor = minor;
@@ -216,7 +226,7 @@ static int binderfs_binder_device_create(struct inode *ref_inode,
 
 err:
 	kfree(name);
-	rust_binder_put_device(device);
+	rust_binder_remove_device(device);
 	mutex_lock(&binderfs_minors_mutex);
 	--info->device_count;
 	ida_free(&binderfs_minors, minor);
@@ -277,7 +287,7 @@ static void binderfs_evict_inode(struct inode *inode)
 	ida_free(&binderfs_minors, minor);
 	mutex_unlock(&binderfs_minors_mutex);
 
-	rust_binder_put_device(device);
+	rust_binder_remove_device(device);
 }
 
 static int binderfs_fs_context_parse_param(struct fs_context *fc,
@@ -628,7 +638,6 @@ static int init_binder_features(struct super_block *sb)
 	return 0;
 }
 
-/*
 static int init_binder_logs(struct super_block *sb)
 {
 	struct dentry *binder_logs_root_dir, *dentry, *proc_log_dir;
@@ -643,21 +652,21 @@ static int init_binder_logs(struct super_block *sb)
 	}
 
 	dentry = rust_binderfs_create_file(binder_logs_root_dir, "stats",
-				      &binder_stats_fops, NULL);
+				      &rust_binder_stats_fops, NULL);
 	if (IS_ERR(dentry)) {
 		ret = PTR_ERR(dentry);
 		goto out;
 	}
 
 	dentry = rust_binderfs_create_file(binder_logs_root_dir, "state",
-				      &binder_state_fops, NULL);
+				      &rust_binder_state_fops, NULL);
 	if (IS_ERR(dentry)) {
 		ret = PTR_ERR(dentry);
 		goto out;
 	}
 
 	dentry = rust_binderfs_create_file(binder_logs_root_dir, "transactions",
-				      &binder_transactions_fops, NULL);
+				      &rust_binder_transactions_fops, NULL);
 	if (IS_ERR(dentry)) {
 		ret = PTR_ERR(dentry);
 		goto out;
@@ -665,8 +674,8 @@ static int init_binder_logs(struct super_block *sb)
 
 	dentry = rust_binderfs_create_file(binder_logs_root_dir,
 				      "transaction_log",
-				      &binder_transaction_log_fops,
-				      &binder_transaction_log);
+				      &rust_binder_transaction_log_fops,
+				      NULL);
 	if (IS_ERR(dentry)) {
 		ret = PTR_ERR(dentry);
 		goto out;
@@ -674,8 +683,8 @@ static int init_binder_logs(struct super_block *sb)
 
 	dentry = rust_binderfs_create_file(binder_logs_root_dir,
 				      "failed_transaction_log",
-				      &binder_transaction_log_fops,
-				      &binder_transaction_log_failed);
+				      &rust_binder_transaction_log_fops,
+				      NULL);
 	if (IS_ERR(dentry)) {
 		ret = PTR_ERR(dentry);
 		goto out;
@@ -692,7 +701,6 @@ static int init_binder_logs(struct super_block *sb)
 out:
 	return ret;
 }
-*/
 
 static int binderfs_fill_super(struct super_block *sb, struct fs_context *fc)
 {
@@ -774,10 +782,8 @@ static int binderfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	if (ret)
 		return ret;
 
-	/*
 	if (info->mount_opts.stats_mode == binderfs_stats_mode_global)
 		return init_binder_logs(sb);
-	*/
 
 	return 0;
 }

@@ -182,7 +182,8 @@ impl Transaction {
     /// stack, otherwise use the destination process.
     pub(crate) fn submit(self: Ref<Self>) -> BinderResult {
         if let Some(thread) = self.find_target_thread() {
-            thread.push_work(self)
+            thread.push_work(self)?;
+            Ok(())
         } else {
             let process = self.to.clone();
             process.push_work(self)

@@ -546,6 +546,13 @@ pub struct CString {
 }
 
 impl CString {
+    /// Clones the provided string into a new buffer.
+    pub fn try_from_cstr(cstr: &CStr) -> Result<CString, Error> {
+        let mut buf = Vec::new();
+        buf.try_extend_from_slice(&cstr.0)?;
+        Ok(Self { buf })
+    }
+
     /// Creates an instance of [`CString`] from the given formatted arguments.
     pub fn try_from_fmt(args: fmt::Arguments<'_>) -> Result<Self, Error> {
         // Calculate the size needed (formatted string plus `NUL` terminator).

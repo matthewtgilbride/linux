@@ -6,7 +6,7 @@ use kernel::{
     cred::Credential,
     file::{self, File, IoctlCommand, IoctlHandler, PollTable},
     io_buffer::{IoBufferReader, IoBufferWriter},
-    linked_list::List,
+    linked_list::{List, GetLinks, Links},
     mm,
     pages::Pages,
     prelude::*,
@@ -258,7 +258,7 @@ impl ProcessNodeRefs {
 }
 
 pub(crate) struct Process {
-    ctx: Ref<Context>,
+    pub(crate) ctx: Ref<Context>,
 
     // The task leader (process).
     pub(crate) task: ARef<Task>,
@@ -278,6 +278,16 @@ pub(crate) struct Process {
 
     // Work node for deferred work item.
     defer_work: Work,
+
+    // Links for process list in Context.
+    links: Links<Process>,
+}
+
+impl GetLinks for Process {
+    type EntryType = Process;
+    fn get_links(data: &Process) -> &Links<Process> {
+        &data.links
+    }
 }
 
 kernel::impl_self_work_adapter!(Process, defer_work, Process::run_deferred);
@@ -298,6 +308,7 @@ impl Process {
             node_refs: unsafe { Mutex::new(ProcessNodeRefs::new()) },
             // SAFETY: `node_refs` is initialised in the call to `init_work_item` below.
             defer_work: unsafe { Work::new() },
+            links: Links::new(),
         })?;
         kernel::init_work_item!(&process);
 
@@ -311,7 +322,37 @@ impl Process {
         let pinned = unsafe { process.as_mut().map_unchecked_mut(|p| &mut p.node_refs) };
         kernel::mutex_init!(pinned, "Process::node_refs");
 
-        Ok(process.into())
+        let process: Ref<Self> = process.into();
+        process.ctx.register_process(process.clone());
+
+        Ok(process)
+    }
+
+    pub(crate) fn debug_print(&self, m: &mut crate::debug::SeqFile) {
+        seq_print!(m, "pid: {}\n", self.task.pid_in_current_ns());
+
+        let inner = self.inner.lock();
+        seq_print!(m, "is_manager: {}\n", inner.is_manager);
+        seq_print!(m, "started_threads: {}\n", inner.started_thread_count);
+        seq_print!(m, "has_proc_work: {}\n", !inner.work.is_empty());
+        seq_print!(m, "ready_thread_ids:");
+        {
+            let mut cursor = inner.ready_threads.cursor_front();
+            if cursor.current().is_none() {
+                seq_print!(m, " none");
+            }
+            while let Some(thread) = cursor.current() {
+                seq_print!(m, " {}", thread.id);
+                cursor.move_next();
+            }
+            seq_print!(m, "\n");
+        }
+        seq_print!(m, "all threads:\n");
+        {
+            for thread in inner.threads.values() {
+                thread.debug_print(m);
+            }
+        }
     }
 
     pub(crate) fn is_dead(&self) -> bool {
@@ -824,6 +865,8 @@ impl Process {
         if self.inner.lock().is_manager {
             self.ctx.unset_manager_node();
         }
+
+        self.ctx.deregister_process(&self);
 
         // Cancel all pending work items.
         while let Some(work) = self.get_work() {

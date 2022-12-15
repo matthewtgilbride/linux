@@ -28,7 +28,6 @@ use crate::{
 
 pub(crate) type BinderResult<T = ()> = core::result::Result<T, BinderError>;
 
-#[derive(Debug)]
 pub(crate) struct BinderError {
     pub(crate) reply: u32,
 }
@@ -56,6 +55,16 @@ impl From<Error> for BinderError {
 impl From<AllocError> for BinderError {
     fn from(_: AllocError) -> Self {
         Self::new_failed()
+    }
+}
+
+impl core::fmt::Debug for BinderError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.reply {
+            BR_FAILED_REPLY => f.pad("BR_FAILED_REPLY"),
+            BR_DEAD_REPLY => f.pad("BR_DEAD_REPLY"),
+            _ => f.debug_struct("BinderError").field("reply", &self.reply).finish(),
+        }
     }
 }
 
@@ -1286,7 +1295,10 @@ impl Thread {
         // Reserve some room at the beginning of the read buffer so that we can send a
         // BR_SPAWN_LOOPER if we need to.
         if req.read_consumed == 0 {
-            writer.write(&BR_NOOP)?;
+            if let Err(err) = writer.write(&BR_NOOP) {
+                pr_warn!("Failure when writing BR_NOOP at beginning of buffer.");
+                return Err(err);
+            }
         }
 
         // Loop doing work while there is room in the buffer.
@@ -1294,8 +1306,14 @@ impl Thread {
         while writer.len() >= size_of::<bindings::binder_transaction_data_secctx>() + 4 {
             match getter(self, wait && initial_len == writer.len()) {
                 Ok(Some(work)) => {
-                    if !work.do_work(self, &mut writer)? {
-                        break;
+                    let work_ty = work.debug_name();
+                    match work.do_work(self, &mut writer) {
+                        Ok(true) => {},
+                        Ok(false) => break,
+                        Err(err) => {
+                            pr_warn!("Failure inside do_work of type {}.", work_ty);
+                            return Err(err)
+                        },
                     }
                 }
                 Ok(None) => {
@@ -1303,6 +1321,9 @@ impl Thread {
                 }
                 Err(err) => {
                     // Propagate the error if we haven't written anything else.
+                    if err != ERESTARTSYS && err != EAGAIN {
+                        pr_warn!("Failure in work getter: {:?}", err);
+                    }
                     if initial_len == writer.len() {
                         return Err(err);
                     } else {
@@ -1334,7 +1355,7 @@ impl Thread {
         // Go through the write buffer.
         if req.write_size > 0 {
             if let Err(err) = self.write(&mut req) {
-                pr_warn!("Write failure {:?}", err);
+                pr_warn!("Write failure {:?} in pid:{}", err, self.process.task.pid_in_current_ns());
                 req.read_consumed = 0;
                 writer.write(&req)?;
                 return Err(err);
@@ -1346,7 +1367,7 @@ impl Thread {
         if req.read_size > 0 {
             ret = self.read(&mut req, wait);
             if ret.is_err() {
-                pr_warn!("Read failure {:?}", ret);
+                pr_warn!("Read failure {:?} in pid:{}", ret, self.process.task.pid_in_current_ns());
             }
         }
 

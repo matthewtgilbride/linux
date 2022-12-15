@@ -60,7 +60,7 @@ impl Transaction {
         let mut alloc = match from.copy_transaction_data(&to, tr, allow_fds, txn_security_ctx_off.as_mut()) {
             Ok(alloc) => alloc,
             Err(err) => {
-                pr_warn!("Failure in copy_transaction_data");
+                pr_warn!("Failure in copy_transaction_data: {:?}", err);
                 return Err(err);
             },
         };
@@ -102,7 +102,7 @@ impl Transaction {
         let mut alloc = match from.copy_transaction_data(&to, tr, allow_fds, None) {
             Ok(alloc) => alloc,
             Err(err) => {
-                pr_warn!("Failure in copy_transaction_data");
+                pr_warn!("Failure in copy_transaction_data: {:?}", err);
                 return Err(err);
             },
         };

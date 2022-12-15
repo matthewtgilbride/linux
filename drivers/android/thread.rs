@@ -1291,7 +1291,7 @@ impl Thread {
 
         // Loop doing work while there is room in the buffer.
         let initial_len = writer.len();
-        while writer.len() >= size_of::<u32>() {
+        while writer.len() >= size_of::<bindings::binder_transaction_data_secctx>() + 4 {
             match getter(self, wait && initial_len == writer.len()) {
                 Ok(Some(work)) => {
                     if !work.do_work(self, &mut writer)? {

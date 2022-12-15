@@ -3,7 +3,7 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 use kernel::{
     io_buffer::IoBufferWriter,
-    linked_list::{GetLinks, Links, List},
+    linked_list::{GetLinks, GetLinksWrapped, Links, List},
     prelude::*,
     sync::{Guard, LockedBy, Mutex, Ref, SpinLock},
     user_ptr::UserSlicePtrWriter,
@@ -60,11 +60,12 @@ pub(crate) struct NodeDeath {
     // TODO: Make this private.
     pub(crate) cookie: usize,
     work_links: Links<dyn DeliverToRead>,
-    // TODO: Add the moment we're using this for two lists, which isn't safe because we want to
-    // remove from the list without knowing the list it's in. We need to separate this out.
     death_links: Links<NodeDeath>,
+    delivered_links: Links<NodeDeath>,
     inner: SpinLock<NodeDeathInner>,
 }
+
+pub(crate) struct DeliveredNodeDeath;
 
 impl NodeDeath {
     /// Constructs a new node death notification object.
@@ -79,6 +80,7 @@ impl NodeDeath {
             cookie,
             work_links: Links::new(),
             death_links: Links::new(),
+            delivered_links: Links::new(),
             inner: unsafe {
                 SpinLock::new(NodeDeathInner {
                     dead: false,
@@ -165,6 +167,17 @@ impl GetLinks for NodeDeath {
     fn get_links(data: &NodeDeath) -> &Links<NodeDeath> {
         &data.death_links
     }
+}
+
+impl GetLinks for DeliveredNodeDeath {
+    type EntryType = NodeDeath;
+    fn get_links(data: &NodeDeath) -> &Links<NodeDeath> {
+        &data.delivered_links
+    }
+}
+
+impl GetLinksWrapped for DeliveredNodeDeath {
+    type Wrapped = Ref<NodeDeath>;
 }
 
 impl DeliverToRead for NodeDeath {

@@ -22,7 +22,7 @@ use crate::{
     allocation::Allocation,
     context::Context,
     defs::*,
-    node::{Node, NodeDeath, NodeRef},
+    node::{DeliveredNodeDeath, Node, NodeDeath, NodeRef},
     range_alloc::RangeAllocator,
     thread::{BinderError, BinderResult, Thread},
     DeliverToRead, DeliverToReadListAdapter,
@@ -66,7 +66,7 @@ pub(crate) struct ProcessInner {
     mapping: Option<Mapping>,
     nodes: RBTree<usize, Ref<Node>>,
 
-    delivered_deaths: List<Ref<NodeDeath>>,
+    delivered_deaths: List<DeliveredNodeDeath>,
 
     /// The number of requested threads that haven't registered yet.
     requested_thread_count: u32,

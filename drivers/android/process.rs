@@ -40,6 +40,8 @@ pub(crate) struct AllocationInfo {
     /// This is used to serialize oneway transaction on the same node. Binder guarantees that
     /// oneway transactions to the same node are delivered sequentially in the order they are sent.
     pub(crate) oneway_node: Option<Ref<Node>>,
+    /// Zero the data in the buffer on free.
+    pub(crate) clear_on_free: bool,
 }
 
 struct Mapping {
@@ -604,7 +606,6 @@ impl Process {
     pub(crate) fn buffer_alloc(&self, size: usize) -> BinderResult<Allocation<'_>> {
         let mut inner = self.inner.lock();
         let mapping = inner.mapping.as_mut().ok_or_else(BinderError::new_dead)?;
-
         let offset = mapping.alloc.reserve_new(size)?;
         Ok(Allocation::new_zerod(
             self,

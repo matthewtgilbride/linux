@@ -71,6 +71,9 @@ impl Transaction {
             }
             alloc.set_info_oneway_node(node_ref.node.clone());
         }
+        if trd.flags & TF_CLEAR_BUF != 0 {
+            alloc.set_info_clear_on_drop();
+        }
         let data_address = alloc.ptr;
         let file_list = alloc.take_file_list();
         alloc.keep_alive();
@@ -113,6 +116,9 @@ impl Transaction {
                 return Err(err);
             },
         };
+        if trd.flags & TF_CLEAR_BUF != 0 {
+            alloc.set_info_clear_on_drop();
+        }
         let data_address = alloc.ptr;
         let file_list = alloc.take_file_list();
         alloc.keep_alive();

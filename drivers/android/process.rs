@@ -31,9 +31,15 @@ use crate::{
 // TODO: Review this:
 // Lock order: Process::node_refs -> Process::inner -> Thread::inner
 
+#[derive(Default)]
 pub(crate) struct AllocationInfo {
     /// Range within the allocation where we can find the offsets to the object descriptors.
-    pub(crate) offsets: Range<usize>,
+    pub(crate) offsets: Option<Range<usize>>,
+    /// When this allocation is dropped, call `pending_oneway_finished` on the node.
+    ///
+    /// This is used to serialize oneway transaction on the same node. Binder guarantees that
+    /// oneway transactions to the same node are delivered sequentially in the order they are sent.
+    pub(crate) oneway_node: Option<Ref<Node>>,
 }
 
 struct Mapping {
@@ -99,7 +105,7 @@ impl ProcessInner {
         }
     }
 
-    fn push_work(&mut self, work: Ref<dyn DeliverToRead>) -> BinderResult {
+    pub(crate) fn push_work(&mut self, work: Ref<dyn DeliverToRead>) -> BinderResult {
         // Try to find a ready thread to which to push the work.
         if let Some(thread) = self.ready_threads.pop_front() {
             // Push to thread while holding state lock. This prevents the thread from giving up

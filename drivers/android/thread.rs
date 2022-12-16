@@ -20,7 +20,7 @@ use kernel::{
 use crate::{
     allocation::{Allocation, AllocationView},
     defs::*,
-    process::{AllocationInfo, Process},
+    process::Process,
     ptr_align,
     transaction::{FileInfo, Transaction},
     DeliverCode, DeliverToRead, DeliverToReadListAdapter,
@@ -1022,16 +1022,12 @@ impl Thread {
                     Ok(()) => end_of_previous_object = offset + object.size()?,
                     Err(err) => {
                         pr_warn!("Error while translating object.");
-                        alloc.set_info(AllocationInfo {
-                            offsets: offsets_start..index_offset,
-                        });
+                        alloc.set_info_offsets(offsets_start..index_offset);
                         return Err(err);
                     }
                 }
             }
-            alloc.set_info(AllocationInfo {
-                offsets: offsets_start..offsets_end,
-            });
+            alloc.set_info_offsets(offsets_start..offsets_end);
         }
 
         // Copy remaining raw data.

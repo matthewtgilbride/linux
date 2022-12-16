@@ -19,7 +19,7 @@ use crate::{
     node::NodeRef,
     process::Process,
     ptr_align,
-    thread::{BinderResult, Thread},
+    thread::{BinderResult, BinderError, Thread},
     DeliverToRead,
 };
 
@@ -64,6 +64,13 @@ impl Transaction {
                 return Err(err);
             },
         };
+        if trd.flags & TF_ONE_WAY != 0 {
+            if stack_next.is_some() {
+                pr_warn!("Oneway transaction should not be in a transaction stack.");
+                return Err(BinderError::new_failed());
+            }
+            alloc.set_info_oneway_node(node_ref.node.clone());
+        }
         let data_address = alloc.ptr;
         let file_list = alloc.take_file_list();
         alloc.keep_alive();
@@ -181,6 +188,15 @@ impl Transaction {
     /// Submits the transaction to a work queue. Use a thread if there is one in the transaction
     /// stack, otherwise use the destination process.
     pub(crate) fn submit(self: Ref<Self>) -> BinderResult {
+        if self.flags & TF_ONE_WAY != 0 {
+            if let Some(node_ref) = self.node_ref.as_ref() {
+                node_ref.node.clone().submit_oneway(self)?;
+                return Ok(());
+            } else {
+                pr_err!("Failed to submit oneway transaction to node.");
+            }
+        }
+
         if let Some(thread) = self.find_target_thread() {
             thread.push_work(self)?;
             Ok(())

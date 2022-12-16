@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0
 
 use core::mem::{replace, size_of, size_of_val, MaybeUninit};
+use core::ops::Range;
 use kernel::{
     bindings, linked_list::List, pages::Pages, prelude::*, sync::Ref, user_ptr::UserSlicePtrReader,
 };
 
 use crate::{
     defs::*,
-    node::NodeRef,
+    node::{Node, NodeRef},
     process::{AllocationInfo, Process},
     thread::{BinderError, BinderResult},
     transaction::FileInfo,
@@ -142,6 +143,18 @@ impl<'a> Allocation<'a> {
     pub(crate) fn set_info(&mut self, info: AllocationInfo) {
         self.allocation_info = Some(info);
     }
+
+    pub(crate) fn get_or_init_info(&mut self) -> &mut AllocationInfo {
+        self.allocation_info.get_or_insert_with(Default::default)
+    }
+
+    pub(crate) fn set_info_offsets(&mut self, offsets: Range<usize>) {
+        self.get_or_init_info().offsets = Some(offsets);
+    }
+
+    pub(crate) fn set_info_oneway_node(&mut self, oneway_node: Ref<Node>) {
+        self.get_or_init_info().oneway_node = Some(oneway_node);
+    }
 }
 
 impl Drop for Allocation<'_> {
@@ -150,13 +163,18 @@ impl Drop for Allocation<'_> {
             return;
         }
 
-        if let Some(info) = &self.allocation_info {
-            let offsets = info.offsets.clone();
-            let view = AllocationView::new(self, offsets.start);
-            for i in offsets.step_by(size_of::<usize>()) {
-                if view.cleanup_object(i).is_err() {
-                    pr_warn!("Error cleaning up object at offset {}\n", i)
+        if let Some(info) = self.allocation_info.take() {
+            if let Some(offsets) = info.offsets.clone() {
+                let view = AllocationView::new(self, offsets.start);
+                for i in offsets.step_by(size_of::<usize>()) {
+                    if view.cleanup_object(i).is_err() {
+                        pr_warn!("Error cleaning up object at offset {}\n", i)
+                    }
                 }
+            }
+
+            if let Some(oneway_node) = info.oneway_node.as_ref() {
+                oneway_node.pending_oneway_finished();
             }
         }
 

@@ -116,6 +116,12 @@ impl<'a> Allocation<'a> {
         })
     }
 
+    pub(crate) fn fill_zero(&self) -> Result {
+        self.iterate(0, self.size, |page, offset, len| {
+            unsafe { page.fill_zero(offset, len) }
+        })
+    }
+
     pub(crate) fn keep_alive(mut self) {
         self.process
             .buffer_make_freeable(self.offset, self.allocation_info.take());
@@ -137,6 +143,10 @@ impl<'a> Allocation<'a> {
     pub(crate) fn set_info_oneway_node(&mut self, oneway_node: Ref<Node>) {
         self.get_or_init_info().oneway_node = Some(oneway_node);
     }
+
+    pub(crate) fn set_info_clear_on_drop(&mut self) {
+        self.get_or_init_info().clear_on_free = true;
+    }
 }
 
 impl Drop for Allocation<'_> {
@@ -157,6 +167,13 @@ impl Drop for Allocation<'_> {
 
             if let Some(oneway_node) = info.oneway_node.as_ref() {
                 oneway_node.pending_oneway_finished();
+            }
+
+            if info.clear_on_free {
+                match self.fill_zero() {
+                    Err(e) => pr_warn!("Failed to clear data on free: {:?}", e),
+                    Ok(()) => ()
+                }
             }
         }
 

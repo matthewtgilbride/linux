@@ -13,7 +13,8 @@ use crate::{
     defs::*,
     process::{Process, ProcessInner},
     thread::{BinderError, BinderResult, Thread},
-    DeliverToRead,
+    transaction::Transaction,
+    DeliverToRead, DeliverToReadListAdapter
 };
 
 struct CountState {
@@ -41,6 +42,8 @@ struct NodeInner {
     strong: CountState,
     weak: CountState,
     death_list: List<Ref<NodeDeath>>,
+    oneway_todo: List<DeliverToReadListAdapter>,
+    has_pending_oneway_todo: bool,
 }
 
 struct NodeDeathInner {
@@ -238,6 +241,8 @@ impl Node {
                 strong: CountState::new(),
                 weak: CountState::new(),
                 death_list: List::new(),
+                oneway_todo: List::new(),
+                has_pending_oneway_todo: false,
             },
         );
         Self {
@@ -353,6 +358,46 @@ impl Node {
         writer.write(&self.ptr)?;
         writer.write(&self.cookie)?;
         Ok(())
+    }
+
+    pub(crate) fn submit_oneway(&self, transaction: Ref<Transaction>) -> BinderResult {
+        let mut guard = self.owner.inner.lock();
+        let inner = self.inner.access_mut(&mut guard);
+        if inner.has_pending_oneway_todo {
+            inner.oneway_todo.push_back(transaction);
+        } else {
+            inner.has_pending_oneway_todo = true;
+            drop(inner);
+            guard.push_work(transaction)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn pending_oneway_finished(&self) {
+        let mut guard = self.owner.inner.lock();
+        let transaction = {
+            let inner = self.inner.access_mut(&mut guard);
+
+            match inner.oneway_todo.pop_front() {
+                Some(transaction) => transaction,
+                None => {
+                    inner.has_pending_oneway_todo = false;
+                    return;
+                }
+            }
+        };
+        let push_res = guard.push_work(transaction);
+        let inner = self.inner.access_mut(&mut guard);
+        match push_res {
+            Ok(()) => inner.has_pending_oneway_todo = true,
+            Err(_err) => {
+                // This only fails if the process is dead.
+                while let Some(work) = inner.oneway_todo.pop_front() {
+                    work.cancel();
+                }
+                inner.has_pending_oneway_todo = false;
+            },
+        }
     }
 }
 

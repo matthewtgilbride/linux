@@ -11,7 +11,7 @@ use kernel::{
     pages::Pages,
     prelude::*,
     rbtree::RBTree,
-    sync::{Guard, Mutex, Ref, RefBorrow, UniqueRef},
+    sync::{Guard, Mutex, SpinLock, Ref, RefBorrow, UniqueRef},
     task::Task,
     user_ptr::{UserSlicePtr, UserSlicePtrReader},
     workqueue::{self, Work},
@@ -274,11 +274,8 @@ pub(crate) struct Process {
     // Credential associated with file when `Process` is created.
     pub(crate) cred: ARef<Credential>,
 
-    // TODO: For now this a mutex because we have allocations in RangeAllocator while holding the
-    // lock. We may want to split up the process state at some point to use a spin lock for the
-    // other fields.
     // TODO: Make this private again.
-    pub(crate) inner: Mutex<ProcessInner>,
+    pub(crate) inner: SpinLock<ProcessInner>,
 
     // References are in a different mutex to avoid recursive acquisition when
     // incrementing/decrementing a node in another process.
@@ -311,7 +308,7 @@ impl Process {
             cred,
             task: Task::current().group_leader().into(),
             // SAFETY: `inner` is initialised in the call to `mutex_init` below.
-            inner: unsafe { Mutex::new(ProcessInner::new()) },
+            inner: unsafe { SpinLock::new(ProcessInner::new()) },
             // SAFETY: `node_refs` is initialised in the call to `mutex_init` below.
             node_refs: unsafe { Mutex::new(ProcessNodeRefs::new()) },
             // SAFETY: `node_refs` is initialised in the call to `init_work_item` below.
@@ -324,7 +321,7 @@ impl Process {
 
         // SAFETY: `inner` is pinned when `Process` is.
         let pinned = unsafe { process.as_mut().map_unchecked_mut(|p| &mut p.inner) };
-        kernel::mutex_init!(pinned, "Process::inner");
+        kernel::spinlock_init!(pinned, "Process::inner");
 
         // SAFETY: `node_refs` is pinned when `Process` is.
         let pinned = unsafe { process.as_mut().map_unchecked_mut(|p| &mut p.node_refs) };
@@ -1136,7 +1133,7 @@ impl<'a> Registration<'a> {
     fn new(
         process: &'a Process,
         thread: &'a Ref<Thread>,
-        guard: &mut Guard<'_, Mutex<ProcessInner>>,
+        guard: &mut Guard<'_, SpinLock<ProcessInner>>,
     ) -> Self {
         guard.ready_threads.push_back(thread.clone());
         Self { process, thread }

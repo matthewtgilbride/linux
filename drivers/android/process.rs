@@ -605,8 +605,18 @@ impl Process {
 
     pub(crate) fn buffer_alloc(&self, size: usize) -> BinderResult<Allocation<'_>> {
         let mut inner = self.inner.lock();
-        let mapping = inner.mapping.as_mut().ok_or_else(BinderError::new_dead)?;
-        let offset = mapping.alloc.reserve_new(size)?;
+        let mut mapping = inner.mapping.as_mut().ok_or_else(BinderError::new_dead)?;
+        let offset = match mapping.alloc.reserve_new_noalloc(size)? {
+            Some(offset) => offset,
+            None => {
+                drop(mapping);
+                drop(inner);
+                let alloc = crate::range_alloc::ReserveNewBox::try_new()?;
+                inner = self.inner.lock();
+                mapping = inner.mapping.as_mut().ok_or_else(BinderError::new_dead)?;
+                mapping.alloc.reserve_new(size, alloc)?
+            },
+        };
         Ok(Allocation::new(
             self,
             offset,

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 
+use core::mem::MaybeUninit;
 use core::ptr::NonNull;
 use kernel::{
     linked_list::{CursorMut, GetLinks, Links, List},
@@ -47,7 +48,8 @@ impl<T> RangeAllocator<T> {
         best
     }
 
-    pub(crate) fn reserve_new(&mut self, size: usize) -> Result<usize> {
+    /// Try to reserve a new buffer, using the provided allocation if necessary.
+    pub(crate) fn reserve_new(&mut self, size: usize, alloc: ReserveNewBox<T>) -> Result<usize> {
         let desc_ptr = match self.find_best_match(size) {
             None => return Err(ENOMEM),
             Some(found) => found,
@@ -61,11 +63,31 @@ impl<T> RangeAllocator<T> {
         }
 
         // We need to break up the descriptor.
-        let new = Box::try_new(Descriptor::new(desc.offset + size, desc.size - size))?;
+        let new = alloc.initialize(Descriptor::new(desc.offset + size, desc.size - size));
         unsafe { self.list.insert_after(desc_ptr, new) };
         desc.state = DescriptorState::Reserved;
         desc.size = size;
         Ok(desc.offset)
+    }
+
+    /// Try to reserve a new buffer, but don't allocate more memory.
+    ///
+    /// If this returns `Ok(None)`, the caller should make an allocation and try again by calling
+    /// `reserve_new`.
+    pub(crate) fn reserve_new_noalloc(&mut self, size: usize) -> Result<Option<usize>> {
+        let desc_ptr = match self.find_best_match(size) {
+            None => return Err(ENOMEM),
+            Some(found) => found,
+        };
+
+        // SAFETY: We hold the only mutable reference to list, so it cannot have changed.
+        let desc = unsafe { &mut *desc_ptr.as_ptr() };
+        if desc.size == size {
+            desc.state = DescriptorState::Reserved;
+            Ok(Some(desc.offset))
+        } else {
+            Ok(None)
+        }
     }
 
     fn free_with_cursor(cursor: &mut CursorMut<'_, Box<Descriptor<T>>>) -> Result {
@@ -185,5 +207,30 @@ impl<T> GetLinks for Descriptor<T> {
     type EntryType = Self;
     fn get_links(desc: &Self) -> &Links<Self> {
         &desc.links
+    }
+}
+
+/// An allocation for use by `reserve_new`.
+pub(crate) struct ReserveNewBox<T> {
+    inner: Box<MaybeUninit<Descriptor<T>>>,
+}
+
+impl<T> ReserveNewBox<T> {
+    pub(crate) fn try_new() -> Result<Self> {
+        Ok(Self {
+            inner: Box::try_new_uninit()?,
+        })
+    }
+
+    fn initialize(self, desc: Descriptor<T>) -> Box<Descriptor<T>> {
+        // SAFETY: Since we are initializing the memory with a valid value, its ok to transmute the
+        // box into an initialized one.
+        //
+        // This can just be `Box::write(self.inner, desc)` when that method is stabilized.
+        unsafe {
+            let inner = Box::into_raw(self.inner) as *mut Descriptor<T>;
+            core::ptr::write(inner, desc);
+            Box::from_raw(inner)
+        }
     }
 }

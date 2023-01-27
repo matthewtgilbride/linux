@@ -336,31 +336,76 @@ impl Process {
         Ok(process)
     }
 
-    pub(crate) fn debug_print(&self, m: &mut crate::debug::SeqFile) {
+    pub(crate) fn debug_print(&self, m: &mut crate::debug::SeqFile) -> Result<()> {
         seq_print!(m, "pid: {}\n", self.task.pid_in_current_ns());
 
-        let inner = self.inner.lock();
-        seq_print!(m, "is_manager: {}\n", inner.is_manager);
-        seq_print!(m, "started_threads: {}\n", inner.started_thread_count);
-        seq_print!(m, "has_proc_work: {}\n", !inner.work.is_empty());
-        seq_print!(m, "ready_thread_ids:");
-        {
-            let mut cursor = inner.ready_threads.cursor_front();
-            if cursor.current().is_none() {
-                seq_print!(m, " none");
+        let is_manager;
+        let started_threads;
+        let has_proc_work;
+        let mut ready_threads = Vec::new();
+        let mut all_threads = Vec::new();
+        loop {
+            let inner = self.inner.lock();
+            let ready_threads_len = {
+                let mut ready_threads_len = 0;
+                let mut cursor = inner.ready_threads.cursor_front();
+                while cursor.current().is_some() {
+                    ready_threads_len += 1;
+                    cursor.move_next();
+                }
+                ready_threads_len
+            };
+            let all_threads_len = inner.threads.values().count();
+            
+            let resize_ready_threads = ready_threads_len < ready_threads.capacity();
+            let resize_all_threads = all_threads_len < all_threads.capacity();
+            if resize_ready_threads || resize_all_threads {
+                drop(inner);
+                ready_threads.try_reserve(ready_threads_len)?;
+                all_threads.try_reserve(all_threads_len)?;
+                continue;
             }
-            while let Some(thread) = cursor.current() {
-                seq_print!(m, " {}", thread.id);
-                cursor.move_next();
+
+            is_manager = inner.is_manager;
+            started_threads = inner.started_thread_count;
+            has_proc_work = !inner.work.is_empty();
+
+            {
+                let mut cursor = inner.ready_threads.cursor_front();
+                while let Some(thread) = cursor.current() {
+                    assert!(ready_threads.len() < ready_threads.capacity());
+                    ready_threads.try_push(thread.id)?;
+                    cursor.move_next();
+                }
+            }
+
+            for thread in inner.threads.values() {
+                assert!(all_threads.len() < all_threads.capacity());
+                all_threads.try_push(thread.clone())?;
+            }
+
+            break;
+        }
+
+        seq_print!(m, "is_manager: {}\n", is_manager);
+        seq_print!(m, "started_threads: {}\n", started_threads);
+        seq_print!(m, "has_proc_work: {}\n", has_proc_work);
+        if ready_threads.is_empty() {
+            seq_print!(m, "ready_thread_ids: none\n");
+        } else {
+            seq_print!(m, "ready_thread_ids:");
+            for thread_id in ready_threads {
+                seq_print!(m, " {}", thread_id);
             }
             seq_print!(m, "\n");
         }
+
         seq_print!(m, "all threads:\n");
-        {
-            for thread in inner.threads.values() {
-                thread.debug_print(m);
-            }
+        for thread in all_threads {
+            thread.debug_print(m);
         }
+
+        Ok(())
     }
 
     pub(crate) fn is_dead(&self) -> bool {

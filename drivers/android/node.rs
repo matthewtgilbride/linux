@@ -5,7 +5,7 @@ use kernel::{
     io_buffer::IoBufferWriter,
     linked_list::{GetLinks, GetLinksWrapped, Links, List},
     prelude::*,
-    sync::{Guard, LockedBy, Mutex, Ref, SpinLock},
+    sync::{Guard, LockedBy, Ref, SpinLock},
     user_ptr::UserSlicePtrWriter,
 };
 
@@ -228,7 +228,7 @@ pub(crate) struct Node {
     cookie: usize,
     pub(crate) flags: u32,
     pub(crate) owner: Ref<Process>,
-    inner: LockedBy<NodeInner, Mutex<ProcessInner>>,
+    inner: LockedBy<NodeInner, SpinLock<ProcessInner>>,
     links: Links<dyn DeliverToRead>,
 }
 
@@ -262,7 +262,7 @@ impl Node {
 
     pub(crate) fn next_death(
         &self,
-        guard: &mut Guard<'_, Mutex<ProcessInner>>,
+        guard: &mut Guard<'_, SpinLock<ProcessInner>>,
     ) -> Option<Ref<NodeDeath>> {
         self.inner.access_mut(guard).death_list.pop_front()
     }
@@ -270,7 +270,7 @@ impl Node {
     pub(crate) fn add_death(
         &self,
         death: Ref<NodeDeath>,
-        guard: &mut Guard<'_, Mutex<ProcessInner>>,
+        guard: &mut Guard<'_, SpinLock<ProcessInner>>,
     ) {
         self.inner.access_mut(guard).death_list.push_back(death);
     }
@@ -324,7 +324,7 @@ impl Node {
     pub(crate) fn populate_counts(
         &self,
         out: &mut BinderNodeInfoForRef,
-        guard: &Guard<'_, Mutex<ProcessInner>>,
+        guard: &Guard<'_, SpinLock<ProcessInner>>,
     ) {
         let inner = self.inner.access(guard);
         out.strong_count = inner.strong.count as _;
@@ -334,7 +334,7 @@ impl Node {
     pub(crate) fn populate_debug_info(
         &self,
         out: &mut BinderNodeDebugInfo,
-        guard: &Guard<'_, Mutex<ProcessInner>>,
+        guard: &Guard<'_, SpinLock<ProcessInner>>,
     ) {
         out.ptr = self.ptr as _;
         out.cookie = self.cookie as _;
@@ -347,7 +347,7 @@ impl Node {
         }
     }
 
-    pub(crate) fn force_has_count(&self, guard: &mut Guard<'_, Mutex<ProcessInner>>) {
+    pub(crate) fn force_has_count(&self, guard: &mut Guard<'_, SpinLock<ProcessInner>>) {
         let inner = self.inner.access_mut(guard);
         inner.strong.has_count = true;
         inner.weak.has_count = true;

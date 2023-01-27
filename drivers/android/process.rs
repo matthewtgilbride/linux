@@ -684,12 +684,17 @@ impl Process {
         }
 
         let ref_pages = Ref::try_from(pages)?;
+        let mapping = Mapping::new(vma.start(), size, ref_pages)?;
 
         // Save pages for later.
         let mut inner = self.inner.lock();
         match &inner.mapping {
-            None => inner.mapping = Some(Mapping::new(vma.start(), size, ref_pages)?),
-            Some(_) => return Err(EBUSY),
+            None => inner.mapping = Some(mapping),
+            Some(_) => {
+                drop(inner);
+                drop(mapping);
+                return Err(EBUSY)
+            },
         }
         Ok(())
     }

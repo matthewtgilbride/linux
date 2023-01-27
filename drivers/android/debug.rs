@@ -70,7 +70,7 @@ fn rust_binder_state_show_impl(m: &mut SeqFile) -> Result<()> {
         let procs = ctx.get_all_procs()?;
         seq_print!(m, "context {}: ({} processes)\n", &*ctx.name, procs.len());
         for proc in procs {
-            proc.debug_print(m);
+            proc.debug_print(m)?;
             seq_print!(m, "\n");
         }
     }

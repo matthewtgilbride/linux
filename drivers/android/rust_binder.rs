@@ -56,6 +56,12 @@ trait DeliverToRead {
     /// Returns the linked list links for the work item.
     fn get_links(&self) -> &Links<dyn DeliverToRead>;
 
+    /// Should we use `wake_up_interruptible_sync` or `wake_up_interruptible` when scheduling this
+    /// work item?
+    ///
+    /// Generally only set to true for non-oneway transactions.
+    fn should_sync_wakeup(&self) -> bool;
+
     /// Get the debug name of this type.
     fn debug_name(&self) -> &'static str {
         core::any::type_name::<Self>()
@@ -98,6 +104,10 @@ impl DeliverToRead for DeliverCode {
 
     fn get_links(&self) -> &Links<dyn DeliverToRead> {
         &self.links
+    }
+
+    fn should_sync_wakeup(&self) -> bool {
+        false
     }
 }
 

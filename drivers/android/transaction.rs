@@ -350,6 +350,10 @@ impl DeliverToRead for Transaction {
     fn get_links(&self) -> &Links<dyn DeliverToRead> {
         &self.links
     }
+
+    fn should_sync_wakeup(&self) -> bool {
+        self.flags & TF_ONE_WAY == 0
+    }
 }
 
 impl Drop for Transaction {

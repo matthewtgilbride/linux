@@ -124,12 +124,14 @@ impl ProcessInner {
         } else if self.is_dead {
             Err(BinderError::new_dead())
         } else {
+            let sync = work.should_sync_wakeup();
+
             // There are no ready threads. Push work to process queue.
             self.work.push_back(work);
 
             // Wake up polling threads, if any.
             for thread in self.threads.values() {
-                thread.notify_if_poll_ready();
+                thread.notify_if_poll_ready(sync);
             }
             Ok(())
         }

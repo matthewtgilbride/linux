@@ -923,10 +923,14 @@ impl Process {
 
     fn deferred_release(self: Ref<Self>) {
         // Mark this process as dead. We'll do the same for the threads later.
-        self.inner.lock().is_dead = true;
+        let is_manager = {
+            let mut inner = self.inner.lock();
+            inner.is_dead = true;
+            inner.is_manager
+        };
 
         // If this process is the manager, unset it.
-        if self.inner.lock().is_manager {
+        if is_manager {
             self.ctx.unset_manager_node();
         }
 

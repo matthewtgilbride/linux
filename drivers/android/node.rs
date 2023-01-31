@@ -220,6 +220,10 @@ impl DeliverToRead for NodeDeath {
     fn get_links(&self) -> &Links<dyn DeliverToRead> {
         &self.work_links
     }
+
+    fn should_sync_wakeup(&self) -> bool {
+        false
+    }
 }
 
 pub(crate) struct Node {
@@ -450,6 +454,10 @@ impl DeliverToRead for Node {
 
     fn get_links(&self) -> &Links<dyn DeliverToRead> {
         &self.links
+    }
+
+    fn should_sync_wakeup(&self) -> bool {
+        false
     }
 }
 

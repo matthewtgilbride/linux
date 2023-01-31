@@ -615,6 +615,7 @@ impl Thread {
     }
 
     pub(crate) fn push_work(&self, work: Ref<dyn DeliverToRead>) -> BinderResult<bool> {
+        let sync = work.should_sync_wakeup();
         {
             let mut inner = self.inner.lock();
             if inner.is_dead {
@@ -629,7 +630,11 @@ impl Thread {
                 return Ok(false);
             }
         }
-        self.work_condvar.notify_one();
+        if sync {
+            self.work_condvar.notify_sync();
+        } else {
+            self.work_condvar.notify_one();
+        }
         Ok(true)
     }
 
@@ -1107,7 +1112,7 @@ impl Thread {
         }
 
         // Notify the thread now that we've released the inner lock.
-        self.work_condvar.notify_one();
+        self.work_condvar.notify_sync();
         false
     }
 
@@ -1392,7 +1397,7 @@ impl Thread {
         }
     }
 
-    pub(crate) fn notify_if_poll_ready(&self) {
+    pub(crate) fn notify_if_poll_ready(&self, sync: bool) {
         // Determine if we need to notify. This requires the lock.
         let inner = self.inner.lock();
         let notify = inner.looper_flags & LOOPER_POLL != 0
@@ -1402,7 +1407,11 @@ impl Thread {
 
         // Now that the lock is no longer held, notify the waiters if we have to.
         if notify {
-            self.work_condvar.notify_one();
+            if sync {
+                self.work_condvar.notify_sync();
+            } else {
+                self.work_condvar.notify_one();
+            }
         }
     }
 
@@ -1471,6 +1480,10 @@ impl DeliverToRead for ThreadError {
 
     fn get_links(&self) -> &Links<dyn DeliverToRead> {
         &self.links
+    }
+
+    fn should_sync_wakeup(&self) -> bool {
+        false
     }
 }
 

@@ -4,6 +4,7 @@ use core::ptr::NonNull;
 use kernel::{
     linked_list::{CursorMut, GetLinks, Links, List},
     prelude::*,
+    macros::kunit_tests,
 };
 
 pub(crate) struct RangeAllocator<T> {
@@ -185,5 +186,13 @@ impl<T> GetLinks for Descriptor<T> {
     type EntryType = Self;
     fn get_links(desc: &Self) -> &Links<Self> {
         &desc.links
+    }
+}
+
+#[kunit_tests(rust_android_binder_driver_range_alloc)]
+mod tests {
+    #[test]
+    fn test_hello_world() {
+        assert_eq!(1,1);
     }
 }

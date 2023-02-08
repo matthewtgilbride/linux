@@ -46,186 +46,6 @@ struct NodeInner {
     has_pending_oneway_todo: bool,
 }
 
-struct NodeDeathInner {
-    dead: bool,
-    cleared: bool,
-    notification_done: bool,
-
-    /// Indicates whether the normal flow was interrupted by removing the handle. In this case, we
-    /// need behave as if the death notification didn't exist (i.e., we don't deliver anything to
-    /// the user.
-    aborted: bool,
-}
-
-pub(crate) struct NodeDeath {
-    node: Ref<Node>,
-    process: Ref<Process>,
-    // TODO: Make this private.
-    pub(crate) cookie: usize,
-    work_links: Links<dyn DeliverToRead>,
-    death_links: Links<NodeDeath>,
-    delivered_links: Links<NodeDeath>,
-    inner: SpinLock<NodeDeathInner>,
-}
-
-pub(crate) struct DeliveredNodeDeath;
-
-impl NodeDeath {
-    /// Constructs a new node death notification object.
-    ///
-    /// # Safety
-    ///
-    /// The caller must call `NodeDeath::init` before using the notification object.
-    pub(crate) unsafe fn new(node: Ref<Node>, process: Ref<Process>, cookie: usize) -> Self {
-        Self {
-            node,
-            process,
-            cookie,
-            work_links: Links::new(),
-            death_links: Links::new(),
-            delivered_links: Links::new(),
-            inner: unsafe {
-                SpinLock::new(NodeDeathInner {
-                    dead: false,
-                    cleared: false,
-                    notification_done: false,
-                    aborted: false,
-                })
-            },
-        }
-    }
-
-    pub(crate) fn init(self: Pin<&mut Self>) {
-        // SAFETY: `inner` is pinned when `self` is.
-        let inner = unsafe { self.map_unchecked_mut(|n| &mut n.inner) };
-        kernel::spinlock_init!(inner, "NodeDeath::inner");
-    }
-
-    /// Sets the cleared flag to `true`.
-    ///
-    /// It removes `self` from the node's death notification list if needed. It must only be called
-    /// once.
-    ///
-    /// Returns whether it needs to be queued.
-    pub(crate) fn set_cleared(self: &Ref<Self>, abort: bool) -> bool {
-        let (needs_removal, needs_queueing) = {
-            // Update state and determine if we need to queue a work item. We only need to do it
-            // when the node is not dead or if the user already completed the death notification.
-            let mut inner = self.inner.lock();
-            inner.cleared = true;
-            if abort {
-                inner.aborted = true;
-            }
-            (!inner.dead, !inner.dead || inner.notification_done)
-        };
-
-        // Remove death notification from node.
-        if needs_removal {
-            let mut owner_inner = self.node.owner.inner.lock();
-            let node_inner = self.node.inner.access_mut(&mut owner_inner);
-            unsafe { node_inner.death_list.remove(self) };
-        }
-
-        needs_queueing
-    }
-
-    /// Sets the 'notification done' flag to `true`.
-    ///
-    /// Returns whether it needs to be queued.
-    pub(crate) fn set_notification_done(self: Ref<Self>, thread: &Thread) {
-        let needs_queueing = {
-            let mut inner = self.inner.lock();
-            inner.notification_done = true;
-            inner.cleared
-        };
-
-        if needs_queueing {
-            let _ = thread.push_work_if_looper(self);
-        }
-    }
-
-    /// Sets the 'dead' flag to `true` and queues work item if needed.
-    pub(crate) fn set_dead(self: Ref<Self>) {
-        let needs_queueing = {
-            let mut inner = self.inner.lock();
-            if inner.cleared {
-                false
-            } else {
-                inner.dead = true;
-                true
-            }
-        };
-
-        if needs_queueing {
-            // Push the death notification to the target process. There is nothing else to do if
-            // it's already dead.
-            let process = self.process.clone();
-            let _ = process.push_work(self);
-        }
-    }
-}
-
-impl GetLinks for NodeDeath {
-    type EntryType = NodeDeath;
-    fn get_links(data: &NodeDeath) -> &Links<NodeDeath> {
-        &data.death_links
-    }
-}
-
-impl GetLinks for DeliveredNodeDeath {
-    type EntryType = NodeDeath;
-    fn get_links(data: &NodeDeath) -> &Links<NodeDeath> {
-        &data.delivered_links
-    }
-}
-
-impl GetLinksWrapped for DeliveredNodeDeath {
-    type Wrapped = Ref<NodeDeath>;
-}
-
-impl DeliverToRead for NodeDeath {
-    fn do_work(self: Ref<Self>, _thread: &Thread, writer: &mut UserSlicePtrWriter) -> Result<bool> {
-        let done = {
-            let inner = self.inner.lock();
-            if inner.aborted {
-                return Ok(true);
-            }
-            inner.cleared && (!inner.dead || inner.notification_done)
-        };
-
-        let cookie = self.cookie;
-        let cmd = if done {
-            BR_CLEAR_DEATH_NOTIFICATION_DONE
-        } else {
-            let process = self.process.clone();
-            let mut process_inner = process.inner.lock();
-            let inner = self.inner.lock();
-            if inner.aborted {
-                return Ok(true);
-            }
-            // We're still holding the inner lock, so it cannot be aborted while we insert it into
-            // the delivered list.
-            process_inner.death_delivered(self.clone());
-            BR_DEAD_BINDER
-        };
-
-        writer.write(&cmd)?;
-        writer.write(&cookie)?;
-
-        // Mimic the original code: we stop processing work items when we get to a death
-        // notification.
-        Ok(cmd != BR_DEAD_BINDER)
-    }
-
-    fn get_links(&self) -> &Links<dyn DeliverToRead> {
-        &self.work_links
-    }
-
-    fn should_sync_wakeup(&self) -> bool {
-        false
-    }
-}
-
 pub(crate) struct Node {
     pub(crate) global_id: u64,
     ptr: usize,
@@ -538,5 +358,185 @@ impl Drop for NodeRef {
         if self.weak_count > 0 {
             self.node.update_refcount(false, false);
         }
+    }
+}
+
+struct NodeDeathInner {
+    dead: bool,
+    cleared: bool,
+    notification_done: bool,
+
+    /// Indicates whether the normal flow was interrupted by removing the handle. In this case, we
+    /// need behave as if the death notification didn't exist (i.e., we don't deliver anything to
+    /// the user.
+    aborted: bool,
+}
+
+pub(crate) struct NodeDeath {
+    node: Ref<Node>,
+    process: Ref<Process>,
+    // TODO: Make this private.
+    pub(crate) cookie: usize,
+    work_links: Links<dyn DeliverToRead>,
+    death_links: Links<NodeDeath>,
+    delivered_links: Links<NodeDeath>,
+    inner: SpinLock<NodeDeathInner>,
+}
+
+pub(crate) struct DeliveredNodeDeath;
+
+impl NodeDeath {
+    /// Constructs a new node death notification object.
+    ///
+    /// # Safety
+    ///
+    /// The caller must call `NodeDeath::init` before using the notification object.
+    pub(crate) unsafe fn new(node: Ref<Node>, process: Ref<Process>, cookie: usize) -> Self {
+        Self {
+            node,
+            process,
+            cookie,
+            work_links: Links::new(),
+            death_links: Links::new(),
+            delivered_links: Links::new(),
+            inner: unsafe {
+                SpinLock::new(NodeDeathInner {
+                    dead: false,
+                    cleared: false,
+                    notification_done: false,
+                    aborted: false,
+                })
+            },
+        }
+    }
+
+    pub(crate) fn init(self: Pin<&mut Self>) {
+        // SAFETY: `inner` is pinned when `self` is.
+        let inner = unsafe { self.map_unchecked_mut(|n| &mut n.inner) };
+        kernel::spinlock_init!(inner, "NodeDeath::inner");
+    }
+
+    /// Sets the cleared flag to `true`.
+    ///
+    /// It removes `self` from the node's death notification list if needed. It must only be called
+    /// once.
+    ///
+    /// Returns whether it needs to be queued.
+    pub(crate) fn set_cleared(self: &Ref<Self>, abort: bool) -> bool {
+        let (needs_removal, needs_queueing) = {
+            // Update state and determine if we need to queue a work item. We only need to do it
+            // when the node is not dead or if the user already completed the death notification.
+            let mut inner = self.inner.lock();
+            inner.cleared = true;
+            if abort {
+                inner.aborted = true;
+            }
+            (!inner.dead, !inner.dead || inner.notification_done)
+        };
+
+        // Remove death notification from node.
+        if needs_removal {
+            let mut owner_inner = self.node.owner.inner.lock();
+            let node_inner = self.node.inner.access_mut(&mut owner_inner);
+            unsafe { node_inner.death_list.remove(self) };
+        }
+
+        needs_queueing
+    }
+
+    /// Sets the 'notification done' flag to `true`.
+    ///
+    /// Returns whether it needs to be queued.
+    pub(crate) fn set_notification_done(self: Ref<Self>, thread: &Thread) {
+        let needs_queueing = {
+            let mut inner = self.inner.lock();
+            inner.notification_done = true;
+            inner.cleared
+        };
+
+        if needs_queueing {
+            let _ = thread.push_work_if_looper(self);
+        }
+    }
+
+    /// Sets the 'dead' flag to `true` and queues work item if needed.
+    pub(crate) fn set_dead(self: Ref<Self>) {
+        let needs_queueing = {
+            let mut inner = self.inner.lock();
+            if inner.cleared {
+                false
+            } else {
+                inner.dead = true;
+                true
+            }
+        };
+
+        if needs_queueing {
+            // Push the death notification to the target process. There is nothing else to do if
+            // it's already dead.
+            let process = self.process.clone();
+            let _ = process.push_work(self);
+        }
+    }
+}
+
+impl GetLinks for NodeDeath {
+    type EntryType = NodeDeath;
+    fn get_links(data: &NodeDeath) -> &Links<NodeDeath> {
+        &data.death_links
+    }
+}
+
+impl GetLinks for DeliveredNodeDeath {
+    type EntryType = NodeDeath;
+    fn get_links(data: &NodeDeath) -> &Links<NodeDeath> {
+        &data.delivered_links
+    }
+}
+
+impl GetLinksWrapped for DeliveredNodeDeath {
+    type Wrapped = Ref<NodeDeath>;
+}
+
+impl DeliverToRead for NodeDeath {
+    fn do_work(self: Ref<Self>, _thread: &Thread, writer: &mut UserSlicePtrWriter) -> Result<bool> {
+        let done = {
+            let inner = self.inner.lock();
+            if inner.aborted {
+                return Ok(true);
+            }
+            inner.cleared && (!inner.dead || inner.notification_done)
+        };
+
+        let cookie = self.cookie;
+        let cmd = if done {
+            BR_CLEAR_DEATH_NOTIFICATION_DONE
+        } else {
+            let process = self.process.clone();
+            let mut process_inner = process.inner.lock();
+            let inner = self.inner.lock();
+            if inner.aborted {
+                return Ok(true);
+            }
+            // We're still holding the inner lock, so it cannot be aborted while we insert it into
+            // the delivered list.
+            process_inner.death_delivered(self.clone());
+            BR_DEAD_BINDER
+        };
+
+        writer.write(&cmd)?;
+        writer.write(&cookie)?;
+
+        // Mimic the original code: we stop processing work items when we get to a death
+        // notification.
+        Ok(cmd != BR_DEAD_BINDER)
+    }
+
+    fn get_links(&self) -> &Links<dyn DeliverToRead> {
+        &self.work_links
+    }
+
+    fn should_sync_wakeup(&self) -> bool {
+        false
     }
 }

@@ -22,6 +22,7 @@
 #include <linux/bug.h>
 #include <linux/build_bug.h>
 #include <linux/clk.h>
+#include <linux/cred.h>
 #include <linux/errname.h>
 #include <linux/fs_parser.h>
 #include <linux/gfp.h>
@@ -34,10 +35,12 @@
 #include <linux/netdevice.h>
 #include <linux/of_device.h>
 #include <linux/platform_device.h>
+#include <linux/sched.h>
 #include <linux/sched/signal.h>
 #include <linux/security.h>
 #include <linux/skbuff.h>
 #include <linux/uaccess.h>
+#include <linux/uidgid.h>
 #include <linux/uio.h>
 
 __noreturn void rust_helper_BUG(void)
@@ -654,6 +657,82 @@ int rust_helper_fs_parse(struct fs_context *fc,
 	return fs_parse(fc, desc, param, result);
 }
 EXPORT_SYMBOL_GPL(rust_helper_fs_parse);
+
+kuid_t rust_helper_task_uid(struct task_struct *task)
+{
+	return task_uid(task);
+}
+EXPORT_SYMBOL_GPL(rust_helper_task_uid);
+
+kuid_t rust_helper_task_euid(struct task_struct *task)
+{
+	return task_euid(task);
+}
+EXPORT_SYMBOL_GPL(rust_helper_task_euid);
+
+#ifndef CONFIG_USER_NS
+
+kuid_t rust_helper_make_kuid(struct user_namespace *from, uid_t uid)
+{
+	return make_kuid(from, uid);
+}
+EXPORT_SYMBOL_GPL(rust_helper_make_kuid);
+
+kgid_t rust_helper_make_kgid(struct user_namespace *from, gid_t gid)
+{
+	return make_kgid(from, gid);
+}
+EXPORT_SYMBOL_GPL(rust_helper_make_kgid);
+
+uid_t rust_helper_from_kuid(struct user_namespace *to, kuid_t uid)
+{
+	return from_kuid(to, uid);
+}
+EXPORT_SYMBOL_GPL(rust_helper_from_kuid);
+
+gid_t rust_helper_from_kgid(struct user_namespace *to, kgid_t gid)
+{
+	return from_kgid(to, gid);
+}
+EXPORT_SYMBOL_GPL(rust_helper_from_kgid);
+
+uid_t rust_helper_from_kuid_munged(struct user_namespace *to, kuid_t uid)
+{
+	return from_kuid_munged(to, uid);
+}
+EXPORT_SYMBOL_GPL(rust_helper_from_kuid_munged);
+
+gid_t rust_helper_from_kgid_munged(struct user_namespace *to, kgid_t gid)
+{
+	return from_kgid_munged(to, gid);
+}
+EXPORT_SYMBOL_GPL(rust_helper_from_kgid_munged);
+
+#endif /* CONFIG_USER_NS */
+
+bool rust_helper_kuid_has_mapping(struct user_namespace *ns, kuid_t uid)
+{
+	return kuid_has_mapping(ns, uid);
+}
+EXPORT_SYMBOL_GPL(rust_helper_kuid_has_mapping);
+
+bool rust_helper_kgid_has_mapping(struct user_namespace *ns, kgid_t gid)
+{
+	return kgid_has_mapping(ns, gid);
+}
+EXPORT_SYMBOL_GPL(rust_helper_kgid_has_mapping);
+
+struct user_namespace *rust_helper_current_user_ns(void)
+{
+	return current_user_ns();
+}
+EXPORT_SYMBOL_GPL(rust_helper_current_user_ns);
+
+pid_t rust_helper_task_tgid_nr_ns(struct task_struct *tsk, struct pid_namespace *ns)
+{
+	return task_tgid_nr_ns(tsk, ns);
+}
+EXPORT_SYMBOL_GPL(rust_helper_task_tgid_nr_ns);
 
 /*
  * We use `bindgen`'s `--size_t-is-usize` option to bind the C `size_t` type

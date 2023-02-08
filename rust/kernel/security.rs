@@ -36,3 +36,52 @@ pub fn binder_transfer_file(from: &Credential, to: &Credential, file: &File) -> 
         bindings::security_binder_transfer_file(from.0.get(), to.0.get(), file.0.get())
     })
 }
+
+/// This struct contains a security context string.
+///
+/// The struct has the invariant that it always contains a valid security context.
+pub struct SecurityCtx {
+    secdata: *mut core::ffi::c_char,
+    seclen: usize,
+}
+
+impl SecurityCtx {
+    /// Get the security context given its id.
+    pub fn from_secid(secid: u32) -> Result<Self> {
+        let mut secdata = core::ptr::null_mut();
+        let mut seclen = 0;
+        // SAFETY: Just a C FFI call. The pointers are valid for writes.
+        unsafe {
+            to_result(bindings::security_secid_to_secctx(secid, &mut secdata, &mut seclen))?;
+        }
+        // If the above call did not fail, then we have a valid security
+        // context, so the invariants are not violated.
+        Ok(Self {
+            secdata,
+            seclen: seclen as usize,
+        })
+    }
+
+    /// Returns the length of this security context.
+    pub fn len(&self) -> usize {
+        self.seclen
+    }
+
+    /// Returns the bytes for this security context.
+    pub fn as_bytes(&self) -> &[u8] {
+        // SAFETY: This is safe by the invariant of this type.
+        unsafe {
+            core::slice::from_raw_parts(self.secdata.cast(), self.seclen)
+        }
+    }
+}
+
+impl Drop for SecurityCtx {
+    fn drop(&mut self) {
+        // SAFETY: The invariants of this type guarantee that the security
+        // context is valid.
+        unsafe {
+            bindings::security_release_secctx(self.secdata, self.seclen as u32);
+        }
+    }
+}

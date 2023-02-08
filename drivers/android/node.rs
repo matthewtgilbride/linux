@@ -3,9 +3,9 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 use kernel::{
     io_buffer::IoBufferWriter,
-    linked_list::{GetLinks, Links, List},
+    linked_list::{GetLinks, GetLinksWrapped, Links, List},
     prelude::*,
-    sync::{Guard, LockedBy, Mutex, Ref, SpinLock},
+    sync::{Guard, LockedBy, Ref, SpinLock},
     user_ptr::UserSlicePtrWriter,
 };
 
@@ -13,7 +13,8 @@ use crate::{
     defs::*,
     process::{Process, ProcessInner},
     thread::{BinderError, BinderResult, Thread},
-    DeliverToRead,
+    transaction::Transaction,
+    DeliverToRead, DeliverToReadListAdapter
 };
 
 struct CountState {
@@ -41,6 +42,8 @@ struct NodeInner {
     strong: CountState,
     weak: CountState,
     death_list: List<Ref<NodeDeath>>,
+    oneway_todo: List<DeliverToReadListAdapter>,
+    has_pending_oneway_todo: bool,
 }
 
 struct NodeDeathInner {
@@ -60,11 +63,12 @@ pub(crate) struct NodeDeath {
     // TODO: Make this private.
     pub(crate) cookie: usize,
     work_links: Links<dyn DeliverToRead>,
-    // TODO: Add the moment we're using this for two lists, which isn't safe because we want to
-    // remove from the list without knowing the list it's in. We need to separate this out.
     death_links: Links<NodeDeath>,
+    delivered_links: Links<NodeDeath>,
     inner: SpinLock<NodeDeathInner>,
 }
+
+pub(crate) struct DeliveredNodeDeath;
 
 impl NodeDeath {
     /// Constructs a new node death notification object.
@@ -79,6 +83,7 @@ impl NodeDeath {
             cookie,
             work_links: Links::new(),
             death_links: Links::new(),
+            delivered_links: Links::new(),
             inner: unsafe {
                 SpinLock::new(NodeDeathInner {
                     dead: false,
@@ -167,6 +172,17 @@ impl GetLinks for NodeDeath {
     }
 }
 
+impl GetLinks for DeliveredNodeDeath {
+    type EntryType = NodeDeath;
+    fn get_links(data: &NodeDeath) -> &Links<NodeDeath> {
+        &data.delivered_links
+    }
+}
+
+impl GetLinksWrapped for DeliveredNodeDeath {
+    type Wrapped = Ref<NodeDeath>;
+}
+
 impl DeliverToRead for NodeDeath {
     fn do_work(self: Ref<Self>, _thread: &Thread, writer: &mut UserSlicePtrWriter) -> Result<bool> {
         let done = {
@@ -204,6 +220,10 @@ impl DeliverToRead for NodeDeath {
     fn get_links(&self) -> &Links<dyn DeliverToRead> {
         &self.work_links
     }
+
+    fn should_sync_wakeup(&self) -> bool {
+        false
+    }
 }
 
 pub(crate) struct Node {
@@ -212,7 +232,7 @@ pub(crate) struct Node {
     cookie: usize,
     pub(crate) flags: u32,
     pub(crate) owner: Ref<Process>,
-    inner: LockedBy<NodeInner, Mutex<ProcessInner>>,
+    inner: LockedBy<NodeInner, SpinLock<ProcessInner>>,
     links: Links<dyn DeliverToRead>,
 }
 
@@ -225,6 +245,8 @@ impl Node {
                 strong: CountState::new(),
                 weak: CountState::new(),
                 death_list: List::new(),
+                oneway_todo: List::new(),
+                has_pending_oneway_todo: false,
             },
         );
         Self {
@@ -244,7 +266,7 @@ impl Node {
 
     pub(crate) fn next_death(
         &self,
-        guard: &mut Guard<'_, Mutex<ProcessInner>>,
+        guard: &mut Guard<'_, SpinLock<ProcessInner>>,
     ) -> Option<Ref<NodeDeath>> {
         self.inner.access_mut(guard).death_list.pop_front()
     }
@@ -252,7 +274,7 @@ impl Node {
     pub(crate) fn add_death(
         &self,
         death: Ref<NodeDeath>,
-        guard: &mut Guard<'_, Mutex<ProcessInner>>,
+        guard: &mut Guard<'_, SpinLock<ProcessInner>>,
     ) {
         self.inner.access_mut(guard).death_list.push_back(death);
     }
@@ -306,7 +328,7 @@ impl Node {
     pub(crate) fn populate_counts(
         &self,
         out: &mut BinderNodeInfoForRef,
-        guard: &Guard<'_, Mutex<ProcessInner>>,
+        guard: &Guard<'_, SpinLock<ProcessInner>>,
     ) {
         let inner = self.inner.access(guard);
         out.strong_count = inner.strong.count as _;
@@ -316,7 +338,7 @@ impl Node {
     pub(crate) fn populate_debug_info(
         &self,
         out: &mut BinderNodeDebugInfo,
-        guard: &Guard<'_, Mutex<ProcessInner>>,
+        guard: &Guard<'_, SpinLock<ProcessInner>>,
     ) {
         out.ptr = self.ptr as _;
         out.cookie = self.cookie as _;
@@ -329,7 +351,7 @@ impl Node {
         }
     }
 
-    pub(crate) fn force_has_count(&self, guard: &mut Guard<'_, Mutex<ProcessInner>>) {
+    pub(crate) fn force_has_count(&self, guard: &mut Guard<'_, SpinLock<ProcessInner>>) {
         let inner = self.inner.access_mut(guard);
         inner.strong.has_count = true;
         inner.weak.has_count = true;
@@ -340,6 +362,46 @@ impl Node {
         writer.write(&self.ptr)?;
         writer.write(&self.cookie)?;
         Ok(())
+    }
+
+    pub(crate) fn submit_oneway(&self, transaction: Ref<Transaction>) -> BinderResult {
+        let mut guard = self.owner.inner.lock();
+        let inner = self.inner.access_mut(&mut guard);
+        if inner.has_pending_oneway_todo {
+            inner.oneway_todo.push_back(transaction);
+        } else {
+            inner.has_pending_oneway_todo = true;
+            drop(inner);
+            guard.push_work(transaction)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn pending_oneway_finished(&self) {
+        let mut guard = self.owner.inner.lock();
+        let transaction = {
+            let inner = self.inner.access_mut(&mut guard);
+
+            match inner.oneway_todo.pop_front() {
+                Some(transaction) => transaction,
+                None => {
+                    inner.has_pending_oneway_todo = false;
+                    return;
+                }
+            }
+        };
+        let push_res = guard.push_work(transaction);
+        let inner = self.inner.access_mut(&mut guard);
+        match push_res {
+            Ok(()) => inner.has_pending_oneway_todo = true,
+            Err(_err) => {
+                // This only fails if the process is dead.
+                while let Some(work) = inner.oneway_todo.pop_front() {
+                    work.cancel();
+                }
+                inner.has_pending_oneway_todo = false;
+            },
+        }
     }
 }
 
@@ -392,6 +454,10 @@ impl DeliverToRead for Node {
 
     fn get_links(&self) -> &Links<dyn DeliverToRead> {
         &self.links
+    }
+
+    fn should_sync_wakeup(&self) -> bool {
+        false
     }
 }
 

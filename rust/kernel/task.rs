@@ -68,6 +68,12 @@ unsafe impl Sync for Task {}
 /// The type of process identifiers (PIDs).
 type Pid = bindings::pid_t;
 
+/// The type of user identifiers (UIDs).
+#[derive(Copy, Clone)]
+pub struct Kuid {
+    kuid: bindings::kuid_t,
+}
+
 impl Task {
     /// Returns a task reference for the currently executing task/thread.
     pub fn current<'a>() -> TaskRef<'a> {
@@ -100,10 +106,36 @@ impl Task {
         unsafe { core::ptr::addr_of!((*self.0.get()).pid).read() }
     }
 
+    /// Returns the UID of the given task.
+    pub fn uid(&self) -> Kuid {
+        Kuid {
+            // SAFETY: By the type invariant, we know that `self.0` is valid.
+            kuid: unsafe { bindings::task_uid(self.0.get()) }
+        }
+    }
+
+    /// Returns the effective UID of the given task.
+    pub fn euid(&self) -> Kuid {
+        Kuid {
+            // SAFETY: By the type invariant, we know that `self.0` is valid.
+            kuid: unsafe { bindings::task_euid(self.0.get()) }
+        }
+    }
+
     /// Determines whether the given task has pending signals.
     pub fn signal_pending(&self) -> bool {
         // SAFETY: By the type invariant, we know that `self.0` is valid.
         unsafe { bindings::signal_pending(self.0.get()) != 0 }
+    }
+
+    /// Returns the given task's pid in the current pid namespace.
+    pub fn pid_in_current_ns(&self) -> Pid {
+        // SAFETY: We know that `self.0.get()` is valid by the type invariant. The rest is just FFI
+        // calls.
+        unsafe {
+            let namespace = bindings::task_active_pid_ns(bindings::get_current());
+            bindings::task_tgid_nr_ns(self.0.get(), namespace)
+        }
     }
 
     /// Starts a new kernel thread and runs it.
@@ -195,6 +227,17 @@ impl Task {
         // And `wake_up_process` is safe to be called for any valid task, even if the task is
         // running.
         unsafe { bindings::wake_up_process(self.0.get()) };
+    }
+}
+
+impl Kuid {
+    /// Converts this kernel UID into a UID that userspace understands. Uses the namespace of the
+    /// current task.
+    pub fn into_uid_in_current_ns(self) -> bindings::uid_t {
+        // SAFETY: Just an FFI call.
+        unsafe {
+            bindings::from_kuid(bindings::current_user_ns(), self.kuid)
+        }
     }
 }
 

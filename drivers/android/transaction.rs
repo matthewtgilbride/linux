@@ -9,6 +9,7 @@ use kernel::{
     linked_list::{GetLinks, Links},
     prelude::*,
     sync::{Ref, SpinLock, UniqueRef},
+    task::Kuid,
     user_ptr::UserSlicePtrWriter,
     Either, ScopeGuard,
 };
@@ -18,7 +19,7 @@ use crate::{
     node::NodeRef,
     process::Process,
     ptr_align,
-    thread::{BinderResult, Thread},
+    thread::{BinderResult, BinderError, Thread},
     DeliverToRead,
 };
 
@@ -40,6 +41,8 @@ pub(crate) struct Transaction {
     offsets_size: usize,
     data_address: usize,
     links: Links<dyn DeliverToRead>,
+    sender_euid: Kuid,
+    txn_security_ctx_off: Option<usize>,
 }
 
 impl Transaction {
@@ -47,11 +50,30 @@ impl Transaction {
         node_ref: NodeRef,
         stack_next: Option<Ref<Transaction>>,
         from: &Ref<Thread>,
-        tr: &BinderTransactionData,
+        tr: &BinderTransactionDataSg,
     ) -> BinderResult<Ref<Self>> {
+        let trd = &tr.transaction_data;
         let allow_fds = node_ref.node.flags & FLAT_BINDER_FLAG_ACCEPTS_FDS != 0;
+        let txn_security_ctx = node_ref.node.flags & FLAT_BINDER_FLAG_TXN_SECURITY_CTX != 0;
+        let mut txn_security_ctx_off = if txn_security_ctx { Some(0) } else { None };
         let to = node_ref.node.owner.clone();
-        let mut alloc = from.copy_transaction_data(&to, tr, allow_fds)?;
+        let mut alloc = match from.copy_transaction_data(&to, tr, allow_fds, txn_security_ctx_off.as_mut()) {
+            Ok(alloc) => alloc,
+            Err(err) => {
+                pr_warn!("Failure in copy_transaction_data: {:?}", err);
+                return Err(err);
+            },
+        };
+        if trd.flags & TF_ONE_WAY != 0 {
+            if stack_next.is_some() {
+                pr_warn!("Oneway transaction should not be in a transaction stack.");
+                return Err(BinderError::new_failed());
+            }
+            alloc.set_info_oneway_node(node_ref.node.clone());
+        }
+        if trd.flags & TF_CLEAR_BUF != 0 {
+            alloc.set_info_clear_on_drop();
+        }
         let data_address = alloc.ptr;
         let file_list = alloc.take_file_list();
         alloc.keep_alive();
@@ -62,13 +84,15 @@ impl Transaction {
             stack_next,
             from: from.clone(),
             to,
-            code: tr.code,
-            flags: tr.flags,
-            data_size: tr.data_size as _,
+            code: trd.code,
+            flags: trd.flags,
+            data_size: trd.data_size as _,
             data_address,
-            offsets_size: tr.offsets_size as _,
+            offsets_size: trd.offsets_size as _,
             links: Links::new(),
             free_allocation: AtomicBool::new(true),
+            sender_euid: from.process.task.euid(),
+            txn_security_ctx_off,
         })?);
 
         // SAFETY: `inner` is pinned when `tr` is.
@@ -81,10 +105,20 @@ impl Transaction {
     pub(crate) fn new_reply(
         from: &Ref<Thread>,
         to: Ref<Process>,
-        tr: &BinderTransactionData,
+        tr: &BinderTransactionDataSg,
         allow_fds: bool,
     ) -> BinderResult<Ref<Self>> {
-        let mut alloc = from.copy_transaction_data(&to, tr, allow_fds)?;
+        let trd = &tr.transaction_data;
+        let mut alloc = match from.copy_transaction_data(&to, tr, allow_fds, None) {
+            Ok(alloc) => alloc,
+            Err(err) => {
+                pr_warn!("Failure in copy_transaction_data: {:?}", err);
+                return Err(err);
+            },
+        };
+        if trd.flags & TF_CLEAR_BUF != 0 {
+            alloc.set_info_clear_on_drop();
+        }
         let data_address = alloc.ptr;
         let file_list = alloc.take_file_list();
         alloc.keep_alive();
@@ -95,13 +129,15 @@ impl Transaction {
             stack_next: None,
             from: from.clone(),
             to,
-            code: tr.code,
-            flags: tr.flags,
-            data_size: tr.data_size as _,
+            code: trd.code,
+            flags: trd.flags,
+            data_size: trd.data_size as _,
             data_address,
-            offsets_size: tr.offsets_size as _,
+            offsets_size: trd.offsets_size as _,
             links: Links::new(),
             free_allocation: AtomicBool::new(true),
+            sender_euid: from.process.task.euid(),
+            txn_security_ctx_off: None,
         })?);
 
         // SAFETY: `inner` is pinned when `tr` is.
@@ -158,8 +194,18 @@ impl Transaction {
     /// Submits the transaction to a work queue. Use a thread if there is one in the transaction
     /// stack, otherwise use the destination process.
     pub(crate) fn submit(self: Ref<Self>) -> BinderResult {
+        if self.flags & TF_ONE_WAY != 0 {
+            if let Some(node_ref) = self.node_ref.as_ref() {
+                node_ref.node.clone().submit_oneway(self)?;
+                return Ok(());
+            } else {
+                pr_err!("Failed to submit oneway transaction to node.");
+            }
+        }
+
         if let Some(thread) = self.find_target_thread() {
-            thread.push_work(self)
+            thread.push_work(self)?;
+            Ok(())
         } else {
             let process = self.to.clone();
             process.push_work(self)
@@ -210,7 +256,8 @@ impl DeliverToRead for Transaction {
             return Ok(true);
         };
 
-        let mut tr = BinderTransactionData::default();
+        let mut tr_sec = BinderTransactionDataSecctx::default();
+        let tr = tr_sec.tr_data();
 
         if let Some(nref) = &self.node_ref {
             let (ptr, cookie) = nref.node.get_id();
@@ -227,15 +274,36 @@ impl DeliverToRead for Transaction {
             tr.data.ptr.offsets = (self.data_address + ptr_align(self.data_size)) as _;
         }
 
+        tr.sender_euid = self.sender_euid.into_uid_in_current_ns();
+
+        tr.sender_pid = 0;
+        if self.node_ref.is_some() && self.flags & TF_ONE_WAY == 0 {
+            // Not a reply and not one-way.
+            let from_proc = &*self.from.process;
+            if !from_proc.is_dead() {
+                let pid = from_proc.task.pid_in_current_ns();
+                tr.sender_pid = pid;
+            }
+        }
+
         let code = if self.node_ref.is_none() {
             BR_REPLY
         } else {
-            BR_TRANSACTION
+            if self.txn_security_ctx_off.is_some() {
+                BR_TRANSACTION_SEC_CTX
+            } else {
+                BR_TRANSACTION
+            }
         };
 
         // Write the transaction code and data to the user buffer.
         writer.write(&code)?;
-        writer.write(&tr)?;
+        if let Some(off) = self.txn_security_ctx_off {
+            tr_sec.secctx = (self.data_address + off) as u64;
+            writer.write(&tr_sec)?;
+        } else {
+            writer.write(&*tr)?;
+        }
 
         // Dismiss the completion of transaction with a failure. No failure paths are allowed from
         // here on out.
@@ -264,7 +332,7 @@ impl DeliverToRead for Transaction {
 
         // When this is not a reply and not an async transaction, update `current_transaction`. If
         // it's a reply, `current_transaction` has already been updated appropriately.
-        if self.node_ref.is_some() && tr.flags & TF_ONE_WAY == 0 {
+        if self.node_ref.is_some() && tr_sec.transaction_data.flags & TF_ONE_WAY == 0 {
             thread.set_current_transaction(self);
         }
 
@@ -272,12 +340,19 @@ impl DeliverToRead for Transaction {
     }
 
     fn cancel(self: Ref<Self>) {
-        let reply = Either::Right(BR_DEAD_REPLY);
-        self.from.deliver_reply(reply, &self);
+        // If this is not a reply or oneway transaction, then send a dead reply.
+        if self.node_ref.is_some() && self.flags & TF_ONE_WAY == 0 {
+            let reply = Either::Right(BR_DEAD_REPLY);
+            self.from.deliver_reply(reply, &self);
+        }
     }
 
     fn get_links(&self) -> &Links<dyn DeliverToRead> {
         &self.links
+    }
+
+    fn should_sync_wakeup(&self) -> bool {
+        self.flags & TF_ONE_WAY == 0
     }
 }
 

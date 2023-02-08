@@ -18,6 +18,7 @@ pub_no_prefix!(
     BR_OK,
     BR_ERROR,
     BR_TRANSACTION,
+    BR_TRANSACTION_SEC_CTX,
     BR_REPLY,
     BR_DEAD_REPLY,
     BR_TRANSACTION_COMPLETE,
@@ -53,11 +54,12 @@ pub_no_prefix!(
     BC_DEAD_BINDER_DONE
 );
 
-pub_no_prefix!(transaction_flags_, TF_ONE_WAY, TF_ACCEPT_FDS);
+pub_no_prefix!(transaction_flags_, TF_ONE_WAY, TF_ACCEPT_FDS, TF_CLEAR_BUF);
 
 pub(crate) use bindings::{
     BINDER_TYPE_BINDER, BINDER_TYPE_FD, BINDER_TYPE_FDA, BINDER_TYPE_HANDLE, BINDER_TYPE_PTR,
     BINDER_TYPE_WEAK_BINDER, BINDER_TYPE_WEAK_HANDLE, flat_binder_object_flags_FLAT_BINDER_FLAG_ACCEPTS_FDS as FLAT_BINDER_FLAG_ACCEPTS_FDS,
+    flat_binder_object_flags_FLAT_BINDER_FLAG_TXN_SECURITY_CTX as FLAT_BINDER_FLAG_TXN_SECURITY_CTX,
 };
 
 macro_rules! decl_wrapper {
@@ -90,6 +92,7 @@ decl_wrapper!(BinderNodeDebugInfo, bindings::binder_node_debug_info);
 decl_wrapper!(BinderNodeInfoForRef, bindings::binder_node_info_for_ref);
 decl_wrapper!(FlatBinderObject, bindings::flat_binder_object);
 decl_wrapper!(BinderTransactionData, bindings::binder_transaction_data);
+decl_wrapper!(BinderTransactionDataSecctx, bindings::binder_transaction_data_secctx);
 decl_wrapper!(
     BinderTransactionDataSg,
     bindings::binder_transaction_data_sg
@@ -112,5 +115,17 @@ impl BinderTransactionData {
             transaction_data: self.0,
             buffers_size,
         })
+    }
+}
+
+impl BinderTransactionDataSecctx {
+    /// View the inner data as wrapped in `BinderTransactionData`.
+    pub(crate) fn tr_data(&mut self) -> &mut BinderTransactionData {
+        // SAFETY: Transparent wrapper is safe to transmute.
+        unsafe {
+            &mut *(&mut self.transaction_data
+               as *mut bindings::binder_transaction_data
+               as *mut BinderTransactionData)
+        }
     }
 }

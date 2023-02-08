@@ -13,7 +13,7 @@
 
 pub use core::pin::Pin;
 
-pub use alloc::{boxed::Box, string::String, vec::Vec};
+pub use alloc::{boxed::Box, string::String, vec::Vec, borrow::Borrow};
 
 pub use macros::{module, vtable};
 

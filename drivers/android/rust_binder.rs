@@ -3,6 +3,7 @@
 //! Binder -- the Android IPC mechanism.
 //!
 //! TODO: This module is a work in progress.
+//! 
 
 use kernel::{
     io_buffer::IoBufferWriter,

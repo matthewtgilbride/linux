@@ -3,11 +3,12 @@
 use core::ptr::NonNull;
 use kernel::{
     linked_list::{CursorMut, GetLinks, Links, List},
-    prelude::*,
+    prelude::*, rbtree::RBTree, 
 };
 
 pub(crate) struct RangeAllocator<T> {
     list: List<Box<Descriptor<T>>>,
+    free_offsets_by_size: RBTree<usize, usize>
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -20,15 +21,21 @@ enum DescriptorState {
 impl<T> RangeAllocator<T> {
     pub(crate) fn new(size: usize) -> Result<Self> {
         let desc = Box::try_new(Descriptor::new(0, size))?;
+
         let mut list = List::new();
+        let mut free_offsets_by_size = RBTree::new();
+        
+        free_offsets_by_size.try_insert(desc.size, desc.offset)?;
         list.push_back(desc);
-        Ok(Self { list })
+
+        Ok(Self { list, free_offsets_by_size })
     }
 
     fn find_best_match(&self, size: usize) -> Option<NonNull<Descriptor<T>>> {
         // TODO: Use a binary tree instead of list for this lookup.
         let mut best = None;
         let mut best_size = usize::MAX;
+        
         let mut cursor = self.list.cursor_front();
         while let Some(desc) = cursor.current() {
             if desc.state == DescriptorState::Free {
@@ -62,13 +69,15 @@ impl<T> RangeAllocator<T> {
 
         // We need to break up the descriptor.
         let new = Box::try_new(Descriptor::new(desc.offset + size, desc.size - size))?;
+        self.free_offsets_by_size.remove(&desc.size);
+        self.free_offsets_by_size.try_insert(new.size, new.offset)?;
         unsafe { self.list.insert_after(desc_ptr, new) };
         desc.state = DescriptorState::Reserved;
         desc.size = size;
         Ok(desc.offset)
     }
 
-    fn free_with_cursor(cursor: &mut CursorMut<'_, Box<Descriptor<T>>>) -> Result {
+    fn free_with_cursor(&mut self, cursor: &mut CursorMut<'_, Box<Descriptor<T>>>) -> Result {
         let mut size = match cursor.current() {
             None => return Err(EINVAL),
             Some(ref mut entry) => {
@@ -78,6 +87,7 @@ impl<T> RangeAllocator<T> {
                     DescriptorState::Reserved => {}
                 }
                 entry.state = DescriptorState::Free;
+                self.free_offsets_by_size.try_insert(entry.size, entry.offset)?;
                 entry.size
             }
         };
@@ -85,8 +95,10 @@ impl<T> RangeAllocator<T> {
         // Try to merge with the next entry.
         if let Some(next) = cursor.peek_next() {
             if next.state == DescriptorState::Free {
-                next.offset -= size;
+                next.offset -= size; // next.offset = 
                 next.size += size;
+                self.free_offsets_by_size.remove(&size);
+                self.free_offsets_by_size.try_insert(next.size, next.offset)?;
                 size = next.size;
                 cursor.remove_current();
             }
@@ -96,6 +108,8 @@ impl<T> RangeAllocator<T> {
         if let Some(prev) = cursor.peek_prev() {
             if prev.state == DescriptorState::Free {
                 prev.size += size;
+                self.free_offsets_by_size.remove(&size);
+                self.free_offsets_by_size.try_insert(prev.size, prev.offset)?;
                 cursor.remove_current();
             }
         }
@@ -122,7 +136,7 @@ impl<T> RangeAllocator<T> {
     pub(crate) fn reservation_abort(&mut self, offset: usize) -> Result {
         // TODO: The force case is currently O(n), but could be made O(1) with unsafe.
         let mut cursor = self.find_at_offset(offset).ok_or(EINVAL)?;
-        Self::free_with_cursor(&mut cursor)
+        self.free_with_cursor(&mut cursor)
     }
 
     pub(crate) fn reservation_commit(&mut self, offset: usize, data: Option<T>) -> Result {

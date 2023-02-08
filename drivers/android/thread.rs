@@ -1207,11 +1207,11 @@ impl Thread {
                 return Err(BinderError::new_failed());
             }
             inner.current_transaction = Some(transaction.clone());
-        }
 
-        // We push the completion as a deferred work so that we wait for the reply before returning
-        // to userland.
-        self.push_work_deferred(completion);
+            // We push the completion as a deferred work so that we wait for the reply before returning
+            // to userland.
+            inner.push_work_deferred(completion);
+        }
         // TODO: Remove completion if submission fails?
         transaction.submit()?;
         Ok(())

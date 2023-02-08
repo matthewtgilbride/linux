@@ -629,11 +629,12 @@ impl Thread {
                 pr_warn!("Failure: work_list empty after pushing {}", ty_name);
                 return Ok(false);
             }
-        }
-        if sync {
-            self.work_condvar.notify_sync();
-        } else {
-            self.work_condvar.notify_one();
+            if sync {
+                self.work_condvar.notify_sync();
+            } else {
+                self.work_condvar.notify_one();
+            }
+            drop(inner);
         }
         Ok(true)
     }

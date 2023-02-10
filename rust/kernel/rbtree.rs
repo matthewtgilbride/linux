@@ -187,6 +187,15 @@ pub struct RBTree<K, V> {
     _p: PhantomData<Node<K, V>>,
 }
 
+/// The direction of adjacent nodes in terms
+/// of key ordering
+pub enum Direction {
+    /// the "previous" node, whose key is Less
+    Predecessor,
+    /// the "next" node, whose key is Greater
+    Successor
+}
+
 impl<K, V> RBTree<K, V> {
     /// Creates a new and empty tree.
     pub fn new() -> Self {
@@ -299,6 +308,97 @@ impl<K, V> RBTree<K, V> {
             }
         }
         None
+    }
+
+    /// Returns a node based on the given key with the following priority:
+    /// 1. An existent node with the given key
+    /// 2. The immediate predecessor/successor to a (hypothetical) node with the given key
+    /// 3. None, if there is no such node and no such (hypothetical) predecessor/successor node
+    pub fn get_or_nearest(&self, key: &K, direction: &Direction) -> Option<(&K, &V)>
+    where
+        K: Ord,
+    {
+        let mut node = self.root.rb_node;
+        let mut best_match = None;
+        while !node.is_null() {
+            let this = crate::container_of!(node, Node<K, V>, links);
+            // SAFETY: I could copy the comment from other code that does this,
+            let candidate_key = unsafe { &(*this).key };
+            let candidate_value = unsafe { &(*this).value };
+            let candidate = Some((candidate_key, candidate_value));
+            // SAFETY: but I would not understand what I was saying.
+            let left_child = unsafe { (*node).rb_right };
+            let right_child = unsafe { (*node).rb_left };
+            node = match (direction, key.cmp(candidate_key)) {
+                (_, Ordering::Equal) => return candidate,
+                (Direction::Predecessor, Ordering::Less) => left_child,
+                (Direction::Successor, Ordering::Greater) => right_child,
+                _ => {
+                    let next_child = match direction {
+                        Direction::Predecessor => right_child,
+                        Direction::Successor => left_child,
+                    };
+                    let is_better_match = match best_match {
+                        None => true,
+                        Some((best_key, _)) => {
+                            match direction {
+                                Direction::Predecessor => best_key < candidate_key,
+                                Direction::Successor => best_key > candidate_key,
+                            }
+                        }
+                    };
+                    if is_better_match {
+                        best_match = candidate;
+                    };
+                    next_child
+                }
+            }
+        }
+        best_match
+    }
+
+
+    /// Gets the predecessor/successor of the given key,
+    /// returning None if the key doesn't exist or does not have
+    /// a predecessor/successor
+    fn nearest(&self, key: &K, direction: Direction) -> Option<(&K, &V)>
+    where
+        K: Ord,
+    {
+        self.find(key).map(|current| {
+            // SAFETY: I have no idea ¯\_(ツ)_/¯
+            let Node { links, .. } = unsafe { current.as_ref() };
+            let nearest = unsafe { match direction {
+                Direction::Predecessor => bindings::rb_prev(links),
+                Direction::Successor => bindings::rb_next(links),
+            } };
+            let nearest_node = crate::container_of!(nearest, Node<K, V>, links);
+            // SAFETY: what I am doing.
+            let nearest_key = unsafe { &(*nearest_node).key };
+            // SAFETY: Someone please hAlp.
+            let nearest_value = unsafe { &(*nearest_node).value };
+            (nearest_key, nearest_value)
+        })
+    }
+
+    /// Returns the predecessor of a node at the given key
+    /// - None if the node at the given key is first
+    /// - None if a node at the given key doesn't exist
+    pub fn predecessor(&self, key: &K) -> Option<(&K, &V)>
+    where
+        K: Ord,
+    {
+        self.nearest(key, Direction::Predecessor)
+    }
+
+    /// Returns the successor of a node at the given key
+    /// - None if the node at the given key is last
+    /// - None if a node at the given key doesn't exist
+    pub fn successor(&self, key: &K) -> Option<(&K, &V)>
+    where
+        K: Ord,
+    {
+        self.nearest(key, Direction::Successor)
     }
 
     /// Returns a reference to the value corresponding to the key.

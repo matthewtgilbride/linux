@@ -187,15 +187,6 @@ pub struct RBTree<K, V> {
     _p: PhantomData<Node<K, V>>,
 }
 
-/// The direction of adjacent nodes in terms
-/// of key ordering
-pub enum Direction {
-    /// the "previous" node, whose key is Less
-    Predecessor,
-    /// the "next" node, whose key is Greater
-    Successor
-}
-
 impl<K, V> RBTree<K, V> {
     /// Creates a new and empty tree.
     pub fn new() -> Self {
@@ -310,11 +301,9 @@ impl<K, V> RBTree<K, V> {
         None
     }
 
-    /// Returns a node based on the given key with the following priority:
-    /// 1. An existent node with the given key
-    /// 2. The immediate predecessor/successor to a (hypothetical) node with the given key
-    /// 3. None, if there is no such node and no such (hypothetical) predecessor/successor node
-    pub fn get_or_nearest(&self, key: &K, direction: &Direction) -> Option<(&K, &V)>
+    /// Returns the smallest node with a key greater than the given key,
+    /// or None of all keys are less than or equal to the given key
+    pub fn upper_bound(&self, key: &K) -> Option<(&K, &V)>
     where
         K: Ord,
     {
@@ -322,83 +311,94 @@ impl<K, V> RBTree<K, V> {
         let mut best_match = None;
         while !node.is_null() {
             let this = crate::container_of!(node, Node<K, V>, links);
-            // SAFETY: I could copy the comment from other code that does this,
+            // SAFETY: `this` is a non-null node so it is valid by the type invariants.
             let candidate_key = unsafe { &(*this).key };
+            // SAFETY: `this` is a non-null node so it is valid by the type invariants.
             let candidate_value = unsafe { &(*this).value };
             let candidate = Some((candidate_key, candidate_value));
-            // SAFETY: but I would not understand what I was saying.
-            let left_child = unsafe { (*node).rb_right };
-            let right_child = unsafe { (*node).rb_left };
-            node = match (direction, key.cmp(candidate_key)) {
-                (_, Ordering::Equal) => return candidate,
-                (Direction::Predecessor, Ordering::Less) => left_child,
-                (Direction::Successor, Ordering::Greater) => right_child,
-                _ => {
-                    let next_child = match direction {
-                        Direction::Predecessor => right_child,
-                        Direction::Successor => left_child,
-                    };
+            // SAFETY: `node` is a non-null node so it is valid by the type invariants.
+            let left_child = unsafe { (*node).rb_left };
+            // SAFETY: `node` is a non-null node so it is valid by the type invariants.
+            let right_child = unsafe { (*node).rb_right };
+            node = match key.cmp(candidate_key) {
+                Ordering::Equal | Ordering::Greater => right_child,
+                Ordering::Less => {
                     let is_better_match = match best_match {
                         None => true,
-                        Some((best_key, _)) => {
-                            match direction {
-                                Direction::Predecessor => best_key < candidate_key,
-                                Direction::Successor => best_key > candidate_key,
-                            }
-                        }
+                        Some((best_key, _)) => best_key > candidate_key,
                     };
                     if is_better_match {
                         best_match = candidate;
                     };
-                    next_child
+                    left_child
                 }
             }
         }
         best_match
     }
 
-
-    /// Gets the predecessor/successor of the given key,
-    /// returning None if the key doesn't exist or does not have
-    /// a predecessor/successor
-    fn nearest(&self, key: &K, direction: Direction) -> Option<(&K, &V)>
+    /// Returns the largest node with a key less than the given key,
+    /// or None if all keys are greater than or equal to the given key
+    pub fn lower_bound(&self, key: &K) -> Option<(&K, &V)>
     where
         K: Ord,
     {
-        self.find(key).map(|current| {
-            // SAFETY: I have no idea ¯\_(ツ)_/¯
-            let Node { links, .. } = unsafe { current.as_ref() };
-            let nearest = unsafe { match direction {
-                Direction::Predecessor => bindings::rb_prev(links),
-                Direction::Successor => bindings::rb_next(links),
-            } };
-            let nearest_node = crate::container_of!(nearest, Node<K, V>, links);
-            // SAFETY: what I am doing.
-            let nearest_key = unsafe { &(*nearest_node).key };
-            // SAFETY: Someone please hAlp.
-            let nearest_value = unsafe { &(*nearest_node).value };
-            (nearest_key, nearest_value)
-        })
+        let mut node = self.root.rb_node;
+        let mut best_match = None;
+        while !node.is_null() {
+            let this = crate::container_of!(node, Node<K, V>, links);
+            // SAFETY: `this` is a non-null node so it is valid by the type invariants.
+            let candidate_key = unsafe { &(*this).key };
+            // SAFETY: `this` is a non-null node so it is valid by the type invariants.
+            let candidate_value = unsafe { &(*this).value };
+            let candidate = Some((candidate_key, candidate_value));
+            // SAFETY: `node` is a non-null node so it is valid by the type invariants.
+            let left_child = unsafe { (*node).rb_left };
+            // SAFETY: `node` is a non-null node so it is valid by the type invariants.
+            let right_child = unsafe { (*node).rb_right };
+            node = match key.cmp(candidate_key) {
+                Ordering::Equal | Ordering::Less => left_child,
+                Ordering::Greater => {
+                    let is_better_match = match best_match {
+                        None => true,
+                        Some((best_key, _)) => best_key < candidate_key,
+                    };
+                    if is_better_match {
+                        best_match = candidate;
+                    };
+                    right_child
+                }
+            }
+        }
+        best_match
     }
 
     /// Returns the predecessor of a node at the given key
-    /// - None if the node at the given key is first
     /// - None if a node at the given key doesn't exist
+    /// - None if the node at the given key is first in sort order
     pub fn predecessor(&self, key: &K) -> Option<(&K, &V)>
     where
         K: Ord,
     {
-        self.nearest(key, Direction::Predecessor)
+        self.find(key).and_then(|found| {
+            // SAFETY: `found` is a non-null node so it is valid by the type invariants.
+            let found_key = unsafe { &((*found.as_ptr()).key) };
+            self.lower_bound(found_key)
+        })
     }
 
     /// Returns the successor of a node at the given key
-    /// - None if the node at the given key is last
     /// - None if a node at the given key doesn't exist
+    /// - None if the node at the given key is last in sort order
     pub fn successor(&self, key: &K) -> Option<(&K, &V)>
     where
         K: Ord,
     {
-        self.nearest(key, Direction::Successor)
+        self.find(key).and_then(|found| {
+            // SAFETY: `found` is a non-null node so it is valid by the type invariants.
+            let found_key = unsafe { &((*found.as_ptr()).key) };
+            self.upper_bound(found_key)
+        })
     }
 
     /// Returns a reference to the value corresponding to the key.

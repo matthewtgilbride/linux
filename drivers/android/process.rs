@@ -437,23 +437,25 @@ impl Process {
         Either::Right(Registration::new(self, thread, &mut inner))
     }
 
-    fn get_thread(self: RefBorrow<'_, Self>, id: i32) -> Result<Ref<Thread>> {
+    fn get_current_thread(self: RefBorrow<'_, Self>) -> Result<Ref<Thread>> {
+        let task = Task::current();
+
         // TODO: Consider using read/write locks here instead.
         {
             let inner = self.inner.lock();
-            if let Some(thread) = inner.threads.get(&id) {
+            if let Some(thread) = inner.threads.get(&task.pid()) {
                 return Ok(thread.clone());
             }
         }
 
         // Allocate a new `Thread` without holding any locks.
-        let ta = Thread::new(id, self.into())?;
-        let node = RBTree::try_allocate_node(id, ta.clone())?;
+        let ta = Thread::new(task.into(), self.into())?;
+        let node = RBTree::try_allocate_node(ta.id, ta.clone())?;
 
         let mut inner = self.inner.lock();
 
         // Recheck. It's possible the thread was create while we were not holding the lock.
-        if let Some(thread) = inner.threads.get(&id) {
+        if let Some(thread) = inner.threads.get(&ta.id) {
             return Ok(thread.clone());
         }
 
@@ -1029,7 +1031,7 @@ impl IoctlHandler for Process {
         cmd: u32,
         reader: &mut UserSlicePtrReader,
     ) -> Result<i32> {
-        let thread = this.get_thread(Task::current().pid())?;
+        let thread = this.get_current_thread()?;
         match cmd {
             bindings::BINDER_SET_MAX_THREADS => this.set_max_threads(reader.read()?),
             bindings::BINDER_SET_CONTEXT_MGR => this.set_as_manager(None, &thread)?,
@@ -1049,7 +1051,7 @@ impl IoctlHandler for Process {
         cmd: u32,
         data: UserSlicePtr,
     ) -> Result<i32> {
-        let thread = this.get_thread(Task::current().pid())?;
+        let thread = this.get_current_thread()?;
         let blocking = (file.flags() & file::flags::O_NONBLOCK) == 0;
         match cmd {
             bindings::BINDER_WRITE_READ => thread.write_read(data, blocking)?,
@@ -1121,7 +1123,7 @@ impl file::Operations for Process {
     }
 
     fn poll(this: RefBorrow<'_, Process>, file: &File, table: &PollTable) -> Result<u32> {
-        let thread = this.get_thread(Task::current().pid())?;
+        let thread = this.get_current_thread()?;
         let (from_proc, mut mask) = thread.poll(file, table);
         if mask == 0 && from_proc && !this.inner.lock().work.is_empty() {
             mask |= bindings::POLLIN;

@@ -13,6 +13,7 @@ use kernel::{
     prelude::*,
     security,
     sync::{CondVar, Ref, SpinLock, UniqueRef},
+    task::Task,
     user_ptr::{UserSlicePtr, UserSlicePtrReader, UserSlicePtrWriter},
     Either,
 };
@@ -430,17 +431,19 @@ impl InnerThread {
 pub(crate) struct Thread {
     pub(crate) id: i32,
     pub(crate) process: Ref<Process>,
+    pub(crate) task: ARef<Task>,
     inner: SpinLock<InnerThread>,
     work_condvar: CondVar,
     links: Links<Thread>,
 }
 
 impl Thread {
-    pub(crate) fn new(id: i32, process: Ref<Process>) -> Result<Ref<Self>> {
+    pub(crate) fn new(task: ARef<Task>, process: Ref<Process>) -> Result<Ref<Self>> {
         let return_work = Ref::try_new(ThreadError::new(InnerThread::set_return_work))?;
         let reply_work = Ref::try_new(ThreadError::new(InnerThread::set_reply_work))?;
         let mut thread = Pin::from(UniqueRef::try_new(Self {
-            id,
+            id: task.pid(),
+            task,
             process,
             // SAFETY: `inner` is initialised in the call to `spinlock_init` below.
             inner: unsafe { SpinLock::new(InnerThread::new()) },

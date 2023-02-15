@@ -6,7 +6,7 @@
 //!
 //! Reference: <https://www.kernel.org/doc/html/latest/core-api/rbtree.html>
 
-use crate::{bindings, Result};
+use crate::{bindings, macros::kunit_tests, Result};
 use alloc::boxed::Box;
 use core::{
     cmp::{Ord, Ordering},
@@ -651,5 +651,109 @@ impl<K, V> RBTreeNode<K, V> {
         // because it came from a `Node`. So it is safe to drop it.
         unsafe { core::ptr::drop_in_place(ret.node.as_mut_ptr()) };
         ret
+    }
+}
+
+#[kunit_tests(rbtree)]
+mod tests {
+    use crate::rbtree::RBTree;
+
+    #[test]
+    fn upper_bound() {
+        let tree = get_test_tree();
+        assert_eq!(tree.upper_bound(&45), Some((&50, &50)));
+    }
+
+    #[test]
+    fn upper_bound_of_exact_match() {
+        let tree = get_test_tree();
+        assert_eq!(tree.upper_bound(&50), Some((&60, &60)));
+    }
+
+    #[test]
+    fn upper_bound_of_less_than_head_is_head() {
+        let tree = get_test_tree();
+        assert_eq!(tree.upper_bound(&5), Some((&10, &10)));
+    }
+
+    #[test]
+    fn upper_bound_of_greater_than_tail_is_none() {
+        let tree = get_test_tree();
+        assert_eq!(tree.upper_bound(&110), None);
+    }
+
+    #[test]
+    fn lower_bound() {
+        let tree = get_test_tree();
+        assert_eq!(tree.lower_bound(&55), Some((&50, &50)));
+    }
+
+    #[test]
+    fn lower_bound_of_exact_match() {
+        let tree = get_test_tree();
+        assert_eq!(tree.lower_bound(&50), Some((&40, &40)));
+    }
+    
+    #[test]
+    fn lower_bound_of_less_than_head_is_none() {
+        let tree = get_test_tree();
+        assert_eq!(tree.lower_bound(&5), None);
+    }
+
+    #[test]
+    fn lower_bound_of_greater_than_tail_is_tail() {
+        let tree = get_test_tree();
+        assert_eq!(tree.lower_bound(&110), Some((&100, &100)));
+    }
+
+    #[test]
+    fn predecessor() {
+        let tree = get_test_tree();
+        assert_eq!(tree.predecessor(&50), Some((&40, &40)));
+    }
+
+    #[test]
+    fn predecessor_of_unknown_key_is_none() {
+        let tree = get_test_tree();
+        assert_eq!(tree.predecessor(&45), None);
+    }
+
+    #[test]
+    fn predecessor_of_head_is_none() {
+        let tree = get_test_tree();
+        assert_eq!(tree.predecessor(&10), None);
+    }
+
+    #[test]
+    fn successor() {
+        let tree = get_test_tree();
+        assert_eq!(tree.successor(&50), Some((&60, &60)));
+    }
+
+    #[test]
+    fn successor_of_unknown_key_is_none() {
+        let tree = get_test_tree();
+        assert_eq!(tree.successor(&45), None);
+    }
+
+    #[test]
+    fn successor_of_tail_is_none() {
+        let tree = get_test_tree();
+        assert_eq!(tree.successor(&100), None);
+    }
+
+    fn get_test_tree() -> RBTree<u32, u32> {
+        let mut tree = RBTree::new();
+        tree.try_insert(10, 10).unwrap();
+        tree.try_insert(20, 20).unwrap();
+        tree.try_insert(30, 30).unwrap();
+        tree.try_insert(40, 40).unwrap();
+        tree.try_insert(50, 50).unwrap();
+        tree.try_insert(60, 60).unwrap();
+        tree.try_insert(70, 70).unwrap();
+        tree.try_insert(80, 80).unwrap();
+        tree.try_insert(90, 90).unwrap();
+        tree.try_insert(100, 100).unwrap();
+        tree
     }
 }

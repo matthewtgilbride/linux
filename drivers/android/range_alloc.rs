@@ -3,12 +3,14 @@
 use core::ptr::NonNull;
 use kernel::{
     linked_list::{CursorMut, GetLinks, Links, List},
-    prelude::*,
     macros::kunit_tests,
+    prelude::*,
+    rbtree::RBTree,
 };
 
 pub(crate) struct RangeAllocator<T> {
     list: List<Box<Descriptor<T>>>,
+    tree: RBTree<usize, Descriptor<T>>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -21,9 +23,12 @@ enum DescriptorState {
 impl<T> RangeAllocator<T> {
     pub(crate) fn new(size: usize) -> Result<Self> {
         let desc = Box::try_new(Descriptor::new(0, size))?;
+        let desc_2 = Descriptor::new(0, size);
         let mut list = List::new();
+        let mut tree = RBTree::new();
         list.push_back(desc);
-        Ok(Self { list })
+        tree.try_insert(0, desc_2)?;
+        Ok(Self { list, tree })
     }
 
     fn find_best_match(&self, size: usize) -> Option<NonNull<Descriptor<T>>> {
@@ -104,6 +109,60 @@ impl<T> RangeAllocator<T> {
         Ok(())
     }
 
+    fn reservation_abort_2(&mut self, offset: usize) -> Result {
+        let current = self.tree.get(&offset);
+        let (new, remove_current_offset, remove_next_offset) = match current {
+            None => return Err(EINVAL),
+            Some(current) if current.state == DescriptorState::Free => return Err(EINVAL),
+            Some(current) if current.state == DescriptorState::Allocated => return Err(EPERM),
+            Some(current) => {
+                let prev = self
+                    .tree
+                    .predecessor(&offset)
+                    .filter(|(_, v)| v.state == DescriptorState::Free)
+                    .map(|(_, v)| v);
+                let next = self
+                    .tree
+                    .successor(&offset)
+                    .filter(|(_, v)| v.state == DescriptorState::Free)
+                    .map(|(_, v)| v);
+
+                let mut offset = current.offset;
+                let mut size = current.size;
+
+                // merge with previous
+                if let Some(p) = prev {
+                    offset = p.offset;
+                    size += p.size;
+                }
+                // merge with next
+                if let Some(n) = next {
+                    size += n.size;
+                }
+
+                (
+                    Descriptor::<T>::new(offset, size),
+                    // if we merged with previous, current needs to be removed
+                    prev.map(|_| current.offset),
+                    // if we merged with next, next needs to be removed
+                    next.map(|n| n.offset),
+                )
+            }
+        };
+
+        self.tree.try_insert(new.offset, new)?;
+
+        if let Some(offset) = remove_current_offset {
+            self.tree.remove(&offset);
+        }
+
+        if let Some(offset) = remove_next_offset {
+            self.tree.remove(&offset);
+        }
+
+        Ok(())
+    }
+
     fn find_at_offset(&mut self, offset: usize) -> Option<CursorMut<'_, Box<Descriptor<T>>>> {
         let mut cursor = self.list.cursor_front_mut();
         while let Some(desc) = cursor.current() {
@@ -118,6 +177,22 @@ impl<T> RangeAllocator<T> {
             cursor.move_next();
         }
         None
+    }
+
+    fn reservation_commit_2(&mut self, offset: usize, data: Option<T>) -> Result {
+        let desc = self.tree.get_mut(&offset).unwrap();
+        desc.state = DescriptorState::Allocated;
+        desc.data = data;
+        Ok(())
+    }
+
+    fn reserve_existing_2(&mut self, offset: usize) -> Result<(usize, Option<T>)> {
+        let desc = self.tree.get_mut(&offset).unwrap();
+        if desc.state != DescriptorState::Allocated {
+            return Err(ENOENT);
+        }
+        desc.state = DescriptorState::Reserved;
+        Ok((desc.size, desc.data.take()))
     }
 
     pub(crate) fn reservation_abort(&mut self, offset: usize) -> Result {
@@ -193,6 +268,6 @@ impl<T> GetLinks for Descriptor<T> {
 mod tests {
     #[test]
     fn test_hello_world() {
-        assert_eq!(1,1);
+        assert_eq!(1, 1);
     }
 }

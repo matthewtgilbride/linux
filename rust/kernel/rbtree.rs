@@ -337,6 +337,42 @@ impl<K, V> RBTree<K, V> {
         best_match
     }
 
+    /// Returns the smallest node with a key greater than the given key,
+    /// or None of all keys are less than or equal to the given key
+    pub fn upper_bound_mut(&mut self, key: &K) -> Option<(&K, &mut V)>
+    where
+        K: Ord,
+    {
+        let mut node = self.root.rb_node;
+        let mut best_match = None;
+        while !node.is_null() {
+            let this = crate::container_of!(node, Node<K, V>, links) as *mut Node<K, V>;
+            // SAFETY: `this` is a non-null node so it is valid by the type invariants.
+            let candidate_key = unsafe { &(*this).key };
+            // SAFETY: `this` is a non-null node so it is valid by the type invariants.
+            let candidate_value = unsafe { &mut *addr_of_mut!((*this).value) };
+            let candidate = Some((candidate_key, candidate_value));
+            // SAFETY: `node` is a non-null node so it is valid by the type invariants.
+            let left_child = unsafe { (*node).rb_left };
+            // SAFETY: `node` is a non-null node so it is valid by the type invariants.
+            let right_child = unsafe { (*node).rb_right };
+            node = match key.cmp(candidate_key) {
+                Ordering::Equal | Ordering::Greater => right_child,
+                Ordering::Less => {
+                    let is_better_match = match best_match {
+                        None => true,
+                        Some((best_key, _)) => best_key > candidate_key,
+                    };
+                    if is_better_match {
+                        best_match = candidate;
+                    };
+                    left_child
+                }
+            }
+        }
+        best_match
+    }
+
     /// Returns the largest node with a key less than the given key,
     /// or None if all keys are greater than or equal to the given key
     pub fn lower_bound(&self, key: &K) -> Option<(&K, &V)>
@@ -373,6 +409,42 @@ impl<K, V> RBTree<K, V> {
         best_match
     }
 
+    /// Returns the largest node with a key less than the given key,
+    /// or None if all keys are greater than or equal to the given key
+    pub fn lower_bound_mut(&mut self, key: &K) -> Option<(&K, &mut V)>
+    where
+        K: Ord,
+    {
+        let mut node = self.root.rb_node;
+        let mut best_match = None;
+        while !node.is_null() {
+            let this = crate::container_of!(node, Node<K, V>, links) as *mut Node<K, V>;
+            // SAFETY: `this` is a non-null node so it is valid by the type invariants.
+            let candidate_key = unsafe { &(*this).key };
+            // SAFETY: `this` is a non-null node so it is valid by the type invariants.
+            let candidate_value = unsafe { &mut *addr_of_mut!((*this).value) };
+            let candidate = Some((candidate_key, candidate_value));
+            // SAFETY: `node` is a non-null node so it is valid by the type invariants.
+            let left_child = unsafe { (*node).rb_left };
+            // SAFETY: `node` is a non-null node so it is valid by the type invariants.
+            let right_child = unsafe { (*node).rb_right };
+            node = match key.cmp(candidate_key) {
+                Ordering::Equal | Ordering::Less => left_child,
+                Ordering::Greater => {
+                    let is_better_match = match best_match {
+                        None => true,
+                        Some((best_key, _)) => best_key < candidate_key,
+                    };
+                    if is_better_match {
+                        best_match = candidate;
+                    };
+                    right_child
+                }
+            }
+        }
+        best_match
+    }
+
     /// Returns the predecessor of a node at the given key
     /// - None if a node at the given key doesn't exist
     /// - None if the node at the given key is first in sort order
@@ -384,6 +456,20 @@ impl<K, V> RBTree<K, V> {
             // SAFETY: `found` is a non-null node so it is valid by the type invariants.
             let found_key = unsafe { &((*found.as_ptr()).key) };
             self.lower_bound(found_key)
+        })
+    }
+
+    /// Returns the predecessor of a node at the given key
+    /// - None if a node at the given key doesn't exist
+    /// - None if the node at the given key is first in sort order
+    pub fn predecessor_mut(&mut self, key: &K) -> Option<(&K, &mut V)>
+    where
+        K: Ord,
+    {
+        self.find(key).and_then(|found| {
+            // SAFETY: `found` is a non-null node so it is valid by the type invariants.
+            let found_key = unsafe { &((*found.as_ptr()).key) };
+            self.lower_bound_mut(found_key)
         })
     }
 
@@ -400,6 +486,34 @@ impl<K, V> RBTree<K, V> {
             self.upper_bound(found_key)
         })
     }
+
+    /// Returns the successor of a node at the given key
+    /// - None if a node at the given key doesn't exist
+    /// - None if the node at the given key is last in sort order
+    pub fn successor_mut(&mut self, key: &K) -> Option<(&K, &mut V)>
+    where
+        K: Ord,
+    {
+        self.find(key).and_then(|found| {
+            // SAFETY: `found` is a non-null node so it is valid by the type invariants.
+            let found_key = unsafe { &((*found.as_ptr()).key) };
+            self.upper_bound_mut(found_key)
+        })
+    }
+
+    /// Returns the successor of a node at the given key
+    /// - None if a node at the given key doesn't exist
+    /// - None if the node at the given key is last in sort order
+    // pub fn successor_mut(&self, key: &K) -> Option<(&K, &mut V)>
+    // where
+    //     K: Ord,
+    // {
+    //     self.find(key).and_then(|found| {
+    //         // SAFETY: `found` is a non-null node so it is valid by the type invariants.
+    //         let found_key = unsafe { &((*found.as_ptr()).key) };
+    //         self.upper_bound_mut(found_key)
+    //     })
+    // }
 
     /// Returns a reference to the value corresponding to the key.
     pub fn get(&self, key: &K) -> Option<&V>
@@ -693,7 +807,7 @@ mod tests {
         let tree = get_test_tree();
         assert_eq!(tree.lower_bound(&50), Some((&40, &40)));
     }
-    
+
     #[test]
     fn lower_bound_of_less_than_head_is_none() {
         let tree = get_test_tree();

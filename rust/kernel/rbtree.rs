@@ -13,7 +13,7 @@ use core::{
     iter::{IntoIterator, Iterator},
     marker::PhantomData,
     mem::MaybeUninit,
-    ptr::{addr_of_mut, NonNull},
+    ptr::{addr_of, addr_of_mut, NonNull},
 };
 
 struct Node<K, V> {
@@ -303,19 +303,16 @@ impl<K, V> RBTree<K, V> {
 
     /// Returns the smallest node with a key greater than the given key,
     /// or None of all keys are less than or equal to the given key
-    pub fn upper_bound(&self, key: &K) -> Option<(&K, &V)>
+    fn upper_bound_raw(&self, key: &K) -> Option<NonNull<Node<K,V>>>
     where
         K: Ord,
     {
         let mut node = self.root.rb_node;
-        let mut best_match = None;
+        let mut best_match: Option<*mut Node<K, V>> = None;
         while !node.is_null() {
-            let this = crate::container_of!(node, Node<K, V>, links);
-            // SAFETY: `this` is a non-null node so it is valid by the type invariants.
-            let candidate_key = unsafe { &(*this).key };
-            // SAFETY: `this` is a non-null node so it is valid by the type invariants.
-            let candidate_value = unsafe { &(*this).value };
-            let candidate = Some((candidate_key, candidate_value));
+            let candidate = crate::container_of!(node, Node<K, V>, links) as *mut Node<K, V>;
+            // SAFETY: `candidate` is a non-null node so it is valid by the type invariants.
+            let candidate_key = unsafe { &(*candidate).key };
             // SAFETY: `node` is a non-null node so it is valid by the type invariants.
             let left_child = unsafe { (*node).rb_left };
             // SAFETY: `node` is a non-null node so it is valid by the type invariants.
@@ -325,16 +322,30 @@ impl<K, V> RBTree<K, V> {
                 Ordering::Less => {
                     let is_better_match = match best_match {
                         None => true,
-                        Some((best_key, _)) => best_key > candidate_key,
+                        Some(current_best) => {
+                            let current_best_key = unsafe { &(*current_best).key };
+                            current_best_key > candidate_key
+                        },
                     };
                     if is_better_match {
-                        best_match = candidate;
+                        best_match = Some(candidate);
                     };
                     left_child
                 }
             }
         }
-        best_match
+        best_match.and_then(|node| NonNull::new(node))
+    }
+
+    /// Returns the smallest node with a key greater than the given key,
+    /// or None of all keys are less than or equal to the given key
+    pub fn upper_bound(&self, key: &K) -> Option<(&K, &V)>
+    where
+        K: Ord,
+    {
+        self.upper_bound_raw(key).map(|node| unsafe {
+            (&(*node.as_ptr()).key, &(*node.as_ptr()).value)
+        })
     }
 
     /// Returns the smallest node with a key greater than the given key,
@@ -343,34 +354,45 @@ impl<K, V> RBTree<K, V> {
     where
         K: Ord,
     {
+        self.upper_bound_raw(key).map(|node| unsafe {
+            (&(*node.as_ptr()).key, &mut (*node.as_ptr()).value)
+        })
+    }
+
+    /// Returns the largest node with a key less than the given key,
+    /// or None if all keys are greater than or equal to the given key
+    fn lower_bound_raw(&self, key: &K) -> Option<NonNull<Node<K,V>>>
+    where
+        K: Ord,
+    {
         let mut node = self.root.rb_node;
-        let mut best_match = None;
+        let mut best_match: Option<*mut Node<K, V>> = None;
         while !node.is_null() {
-            let this = crate::container_of!(node, Node<K, V>, links) as *mut Node<K, V>;
-            // SAFETY: `this` is a non-null node so it is valid by the type invariants.
-            let candidate_key = unsafe { &(*this).key };
-            // SAFETY: `this` is a non-null node so it is valid by the type invariants.
-            let candidate_value = unsafe { &mut *addr_of_mut!((*this).value) };
-            let candidate = Some((candidate_key, candidate_value));
+            let candidate = crate::container_of!(node, Node<K, V>, links) as *mut Node<K, V>;
+            // SAFETY: `candidate` is a non-null node so it is valid by the type invariants.
+            let candidate_key = unsafe { &(*candidate).key };
             // SAFETY: `node` is a non-null node so it is valid by the type invariants.
             let left_child = unsafe { (*node).rb_left };
             // SAFETY: `node` is a non-null node so it is valid by the type invariants.
             let right_child = unsafe { (*node).rb_right };
             node = match key.cmp(candidate_key) {
-                Ordering::Equal | Ordering::Greater => right_child,
-                Ordering::Less => {
+                Ordering::Equal | Ordering::Less => left_child,
+                Ordering::Greater => {
                     let is_better_match = match best_match {
                         None => true,
-                        Some((best_key, _)) => best_key > candidate_key,
+                        Some(current_best) => {
+                            let current_best_key = unsafe { &(*current_best).key };
+                            current_best_key < candidate_key
+                        },
                     };
                     if is_better_match {
-                        best_match = candidate;
+                        best_match = Some(candidate);
                     };
-                    left_child
+                    right_child
                 }
             }
         }
-        best_match
+        best_match.and_then(|node| NonNull::new(node))
     }
 
     /// Returns the largest node with a key less than the given key,
@@ -379,34 +401,9 @@ impl<K, V> RBTree<K, V> {
     where
         K: Ord,
     {
-        let mut node = self.root.rb_node;
-        let mut best_match = None;
-        while !node.is_null() {
-            let this = crate::container_of!(node, Node<K, V>, links);
-            // SAFETY: `this` is a non-null node so it is valid by the type invariants.
-            let candidate_key = unsafe { &(*this).key };
-            // SAFETY: `this` is a non-null node so it is valid by the type invariants.
-            let candidate_value = unsafe { &(*this).value };
-            let candidate = Some((candidate_key, candidate_value));
-            // SAFETY: `node` is a non-null node so it is valid by the type invariants.
-            let left_child = unsafe { (*node).rb_left };
-            // SAFETY: `node` is a non-null node so it is valid by the type invariants.
-            let right_child = unsafe { (*node).rb_right };
-            node = match key.cmp(candidate_key) {
-                Ordering::Equal | Ordering::Less => left_child,
-                Ordering::Greater => {
-                    let is_better_match = match best_match {
-                        None => true,
-                        Some((best_key, _)) => best_key < candidate_key,
-                    };
-                    if is_better_match {
-                        best_match = candidate;
-                    };
-                    right_child
-                }
-            }
-        }
-        best_match
+        self.lower_bound_raw(key).map(|node| unsafe {
+            (&(*node.as_ptr()).key, &(*node.as_ptr()).value)
+        })
     }
 
     /// Returns the largest node with a key less than the given key,
@@ -415,34 +412,9 @@ impl<K, V> RBTree<K, V> {
     where
         K: Ord,
     {
-        let mut node = self.root.rb_node;
-        let mut best_match = None;
-        while !node.is_null() {
-            let this = crate::container_of!(node, Node<K, V>, links) as *mut Node<K, V>;
-            // SAFETY: `this` is a non-null node so it is valid by the type invariants.
-            let candidate_key = unsafe { &(*this).key };
-            // SAFETY: `this` is a non-null node so it is valid by the type invariants.
-            let candidate_value = unsafe { &mut *addr_of_mut!((*this).value) };
-            let candidate = Some((candidate_key, candidate_value));
-            // SAFETY: `node` is a non-null node so it is valid by the type invariants.
-            let left_child = unsafe { (*node).rb_left };
-            // SAFETY: `node` is a non-null node so it is valid by the type invariants.
-            let right_child = unsafe { (*node).rb_right };
-            node = match key.cmp(candidate_key) {
-                Ordering::Equal | Ordering::Less => left_child,
-                Ordering::Greater => {
-                    let is_better_match = match best_match {
-                        None => true,
-                        Some((best_key, _)) => best_key < candidate_key,
-                    };
-                    if is_better_match {
-                        best_match = candidate;
-                    };
-                    right_child
-                }
-            }
-        }
-        best_match
+        self.lower_bound_raw(key).map(|node| unsafe {
+            (&(*node.as_ptr()).key, &mut (*node.as_ptr()).value)
+        })
     }
 
     /// Returns the predecessor of a node at the given key

@@ -11,6 +11,7 @@ use kernel::{
 pub(crate) struct RangeAllocator<T> {
     list: List<Box<Descriptor<T>>>,
     tree: RBTree<usize, Descriptor<T>>,
+    free_tree: RBTree<(usize, usize), usize>
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -26,9 +27,11 @@ impl<T> RangeAllocator<T> {
         let desc_2 = Descriptor::new(0, size);
         let mut list = List::new();
         let mut tree = RBTree::new();
+        let mut free_tree = RBTree::new();
         list.push_back(desc);
         tree.try_insert(0, desc_2)?;
-        Ok(Self { list, tree })
+        free_tree.try_insert((size, 0), 0)?;
+        Ok(Self { list, tree, free_tree })
     }
 
     fn find_best_match(&self, size: usize) -> Option<NonNull<Descriptor<T>>> {
@@ -51,6 +54,44 @@ impl<T> RangeAllocator<T> {
             cursor.move_next();
         }
         best
+    }
+
+    fn find_best_match_2(&mut self, size: usize) -> Option<&mut Descriptor<T>> {
+        let best_match_key = self.free_tree.upper_bound(&(size, 0));
+        best_match_key.and_then(|(_, offset)| {
+            self.tree.get_mut(offset)
+        })
+    }
+
+    fn reserve_new_2(&mut self, size: usize) -> Result<usize> {
+        let (offset, new) = match self.find_best_match_2(size) {
+            None => return Err(ENOMEM),
+            Some(found) => {
+                found.state = DescriptorState::Reserved;
+                if found.size != size {
+                    let new = Descriptor::new(found.offset + size, found.size - size);
+                    (found.offset, Some(new))
+                } else {
+                    (found.offset, None)
+                }
+            },
+        };
+
+        // if desc.size != size {
+        //     let new = Descriptor::new(desc.offset + size, desc.size - size);
+        //     self.tree.try_insert(new.offset, new)?;
+        //     self.free_tree.try_insert((new.size, new.offset), new.offset)?;
+        //     desc.size = size;
+
+        // } 
+
+        
+        if let Some(new) = new {
+            self.free_tree.try_insert((new.size, new.offset), new.offset)?;
+            self.tree.try_insert(new.offset, new)?;
+        }
+        self.free_tree.remove(&(size, offset));
+        Ok(offset)
     }
 
     pub(crate) fn reserve_new(&mut self, size: usize) -> Result<usize> {

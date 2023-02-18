@@ -303,7 +303,7 @@ impl<K, V> RBTree<K, V> {
 
     /// Returns the smallest node with a key greater than the given key,
     /// or None of all keys are less than or equal to the given key
-    fn upper_bound_raw(&self, key: &K) -> Option<NonNull<Node<K,V>>>
+    fn upper_bound_raw(&self, key: &K, return_equal: bool) -> Option<NonNull<Node<K,V>>>
     where
         K: Ord,
     {
@@ -318,7 +318,11 @@ impl<K, V> RBTree<K, V> {
             // SAFETY: `node` is a non-null node so it is valid by the type invariants.
             let right_child = unsafe { (*node).rb_right };
             node = match key.cmp(candidate_key) {
-                Ordering::Equal | Ordering::Greater => right_child,
+                Ordering::Equal => {
+                    best_match = Some(candidate);
+                    break;
+                }
+                Ordering::Greater => right_child,
                 Ordering::Less => {
                     let is_better_match = match best_match {
                         None => true,
@@ -339,29 +343,29 @@ impl<K, V> RBTree<K, V> {
 
     /// Returns the smallest node with a key greater than the given key,
     /// or None of all keys are less than or equal to the given key
-    pub fn upper_bound(&self, key: &K) -> Option<(&K, &V)>
+    pub fn upper_bound(&self, key: &K, return_equal: bool) -> Option<(&K, &V)>
     where
         K: Ord,
     {
-        self.upper_bound_raw(key).map(|node| unsafe {
+        self.upper_bound_raw(key, return_equal).map(|node| unsafe {
             (&(*node.as_ptr()).key, &(*node.as_ptr()).value)
         })
     }
 
     /// Returns the smallest node with a key greater than the given key,
     /// or None of all keys are less than or equal to the given key
-    pub fn upper_bound_mut(&mut self, key: &K) -> Option<(&K, &mut V)>
+    pub fn upper_bound_mut(&mut self, key: &K, return_equal: bool) -> Option<(&K, &mut V)>
     where
         K: Ord,
     {
-        self.upper_bound_raw(key).map(|node| unsafe {
+        self.upper_bound_raw(key, return_equal).map(|node| unsafe {
             (&(*node.as_ptr()).key, &mut (*node.as_ptr()).value)
         })
     }
 
     /// Returns the largest node with a key less than the given key,
     /// or None if all keys are greater than or equal to the given key
-    fn lower_bound_raw(&self, key: &K) -> Option<NonNull<Node<K,V>>>
+    fn lower_bound_raw(&self, key: &K, return_equal: bool) -> Option<NonNull<Node<K,V>>>
     where
         K: Ord,
     {
@@ -376,7 +380,11 @@ impl<K, V> RBTree<K, V> {
             // SAFETY: `node` is a non-null node so it is valid by the type invariants.
             let right_child = unsafe { (*node).rb_right };
             node = match key.cmp(candidate_key) {
-                Ordering::Equal | Ordering::Less => left_child,
+                Ordering::Equal => {
+                    best_match = Some(candidate);
+                    break;
+                },
+                Ordering::Less => left_child,
                 Ordering::Greater => {
                     let is_better_match = match best_match {
                         None => true,
@@ -397,22 +405,22 @@ impl<K, V> RBTree<K, V> {
 
     /// Returns the largest node with a key less than the given key,
     /// or None if all keys are greater than or equal to the given key
-    pub fn lower_bound(&self, key: &K) -> Option<(&K, &V)>
+    pub fn lower_bound(&self, key: &K, return_equal: bool) -> Option<(&K, &V)>
     where
         K: Ord,
     {
-        self.lower_bound_raw(key).map(|node| unsafe {
+        self.lower_bound_raw(key, return_equal).map(|node| unsafe {
             (&(*node.as_ptr()).key, &(*node.as_ptr()).value)
         })
     }
 
     /// Returns the largest node with a key less than the given key,
     /// or None if all keys are greater than or equal to the given key
-    pub fn lower_bound_mut(&mut self, key: &K) -> Option<(&K, &mut V)>
+    pub fn lower_bound_mut(&mut self, key: &K, return_equal: bool) -> Option<(&K, &mut V)>
     where
         K: Ord,
     {
-        self.lower_bound_raw(key).map(|node| unsafe {
+        self.lower_bound_raw(key, return_equal).map(|node| unsafe {
             (&(*node.as_ptr()).key, &mut (*node.as_ptr()).value)
         })
     }
@@ -427,7 +435,7 @@ impl<K, V> RBTree<K, V> {
         self.find(key).and_then(|found| {
             // SAFETY: `found` is a non-null node so it is valid by the type invariants.
             let found_key = unsafe { &((*found.as_ptr()).key) };
-            self.lower_bound(found_key)
+            self.lower_bound(found_key, false)
         })
     }
 
@@ -441,7 +449,7 @@ impl<K, V> RBTree<K, V> {
         self.find(key).and_then(|found| {
             // SAFETY: `found` is a non-null node so it is valid by the type invariants.
             let found_key = unsafe { &((*found.as_ptr()).key) };
-            self.lower_bound_mut(found_key)
+            self.lower_bound_mut(found_key, false)
         })
     }
 
@@ -455,7 +463,7 @@ impl<K, V> RBTree<K, V> {
         self.find(key).and_then(|found| {
             // SAFETY: `found` is a non-null node so it is valid by the type invariants.
             let found_key = unsafe { &((*found.as_ptr()).key) };
-            self.upper_bound(found_key)
+            self.upper_bound(found_key, false)
         })
     }
 
@@ -469,23 +477,9 @@ impl<K, V> RBTree<K, V> {
         self.find(key).and_then(|found| {
             // SAFETY: `found` is a non-null node so it is valid by the type invariants.
             let found_key = unsafe { &((*found.as_ptr()).key) };
-            self.upper_bound_mut(found_key)
+            self.upper_bound_mut(found_key, false)
         })
     }
-
-    /// Returns the successor of a node at the given key
-    /// - None if a node at the given key doesn't exist
-    /// - None if the node at the given key is last in sort order
-    // pub fn successor_mut(&self, key: &K) -> Option<(&K, &mut V)>
-    // where
-    //     K: Ord,
-    // {
-    //     self.find(key).and_then(|found| {
-    //         // SAFETY: `found` is a non-null node so it is valid by the type invariants.
-    //         let found_key = unsafe { &((*found.as_ptr()).key) };
-    //         self.upper_bound_mut(found_key)
-    //     })
-    // }
 
     /// Returns a reference to the value corresponding to the key.
     pub fn get(&self, key: &K) -> Option<&V>
@@ -747,49 +741,49 @@ mod tests {
     #[test]
     fn upper_bound() {
         let tree = get_test_tree();
-        assert_eq!(tree.upper_bound(&45), Some((&50, &50)));
+        assert_eq!(tree.upper_bound(&45, false), Some((&50, &50)));
     }
 
     #[test]
     fn upper_bound_of_exact_match() {
         let tree = get_test_tree();
-        assert_eq!(tree.upper_bound(&50), Some((&60, &60)));
+        assert_eq!(tree.upper_bound(&50, false), Some((&60, &60)));
     }
 
     #[test]
     fn upper_bound_of_less_than_head_is_head() {
         let tree = get_test_tree();
-        assert_eq!(tree.upper_bound(&5), Some((&10, &10)));
+        assert_eq!(tree.upper_bound(&5, false), Some((&10, &10)));
     }
 
     #[test]
     fn upper_bound_of_greater_than_tail_is_none() {
         let tree = get_test_tree();
-        assert_eq!(tree.upper_bound(&110), None);
+        assert_eq!(tree.upper_bound(&110, false), None);
     }
 
     #[test]
     fn lower_bound() {
         let tree = get_test_tree();
-        assert_eq!(tree.lower_bound(&55), Some((&50, &50)));
+        assert_eq!(tree.lower_bound(&55, false), Some((&50, &50)));
     }
 
     #[test]
     fn lower_bound_of_exact_match() {
         let tree = get_test_tree();
-        assert_eq!(tree.lower_bound(&50), Some((&40, &40)));
+        assert_eq!(tree.lower_bound(&50, false), Some((&40, &40)));
     }
 
     #[test]
     fn lower_bound_of_less_than_head_is_none() {
         let tree = get_test_tree();
-        assert_eq!(tree.lower_bound(&5), None);
+        assert_eq!(tree.lower_bound(&5, false), None);
     }
 
     #[test]
     fn lower_bound_of_greater_than_tail_is_tail() {
         let tree = get_test_tree();
-        assert_eq!(tree.lower_bound(&110), Some((&100, &100)));
+        assert_eq!(tree.lower_bound(&110, false), Some((&100, &100)));
     }
 
     #[test]

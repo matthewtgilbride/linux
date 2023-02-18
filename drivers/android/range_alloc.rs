@@ -29,7 +29,7 @@ impl<T> RangeAllocator<T> {
     }
 
     fn find_best_match(&mut self, size: usize) -> Option<&mut Descriptor<T>> {
-        let best_match_key = self.free_tree.upper_bound(&(size, 0));
+        let best_match_key = self.free_tree.upper_bound(&(size, 0), true);
         best_match_key.and_then(|(_, offset)| {
             self.tree.get_mut(offset)
         })

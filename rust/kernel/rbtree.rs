@@ -7,13 +7,13 @@
 //! Reference: <https://www.kernel.org/doc/html/latest/core-api/rbtree.html>
 
 use crate::{bindings, macros::kunit_tests, Result};
-use alloc::{borrow::ToOwned, boxed::Box};
+use alloc::{boxed::Box};
 use core::{
     cmp::{Ord, Ordering},
     iter::{IntoIterator, Iterator},
     marker::PhantomData,
     mem::MaybeUninit,
-    ptr::{addr_of, addr_of_mut, NonNull},
+    ptr::{addr_of_mut, NonNull},
 };
 
 struct Node<K, V> {
@@ -305,7 +305,7 @@ impl<K, V> RBTree<K, V> {
         &self,
         search_key: &K,
         neighbor_type: NeighborType,
-        search_type: Option<NeighborhoodSearchType>,
+        search_type: NeighborSearchType,
     ) -> Option<NonNull<Node<K, V>>>
     where
         K: Ord,
@@ -324,7 +324,7 @@ impl<K, V> RBTree<K, V> {
 
             node = if search_key == this_key {
                 exact_match_found = true;
-                if search_type == Some(NeighborhoodSearchType::ReturnSearchKey) {
+                if search_type == NeighborSearchType::SearchKeyFoundIsReturned {
                     return NonNull::new(this);
                 }
 
@@ -373,7 +373,7 @@ impl<K, V> RBTree<K, V> {
                 }
             };
         }
-        if search_type == Some(NeighborhoodSearchType::SearchKeyMustExist) && !exact_match_found {
+        if search_type == NeighborSearchType::SearchKeyNotFoundReturnsNone && !exact_match_found {
             return None;
         }
         best_match
@@ -381,21 +381,77 @@ impl<K, V> RBTree<K, V> {
 
     /// Returns the largest node with a key less than the given key,
     /// or None if all keys are greater than or equal to the given key
+    /// 
+    /// ```
+    /// use kernel::rbtree::RBTree;
+    /// // Create a new tree.
+    /// let mut tree = RBTree::new();
+    ///
+    /// // Insert five elements.
+    /// tree.try_insert(20, 200)?;
+    /// tree.try_insert(10, 100)?;
+    /// tree.try_insert(30, 300)?;
+    /// tree.try_insert(50, 500)?;
+    /// tree.try_insert(40, 400)?;
+    /// 
+    /// // `lower_bound` of an existent key returns it's predecessor
+    /// let mut lower_bound = tree.lower_bound(&30);
+    /// assert_eq!(lower_bound, Some((&20, &200)));
+    /// 
+    /// // `lower_bound` of a non-existent key returns the largest node with a key smaller than the given key
+    /// lower_bound = tree.lower_bound(&25);
+    /// assert_eq!(lower_bound, Some((&20, &200)));
+    /// 
+    /// // `lower_bound` of the smallest key returns None
+    /// lower_bound = tree.lower_bound(&10);
+    /// assert_eq!(lower_bound, None);
+    /// 
+    /// // `lower_bound` of a key smaller than the smallest key returns None
+    /// lower_bound = tree.lower_bound(&5);
+    /// assert_eq!(lower_bound, None);
+    /// 
+    /// // `lower_bound` of a key larger than largest key returns the the largest node
+    /// lower_bound = tree.lower_bound(&55);
+    /// assert_eq!(lower_bound, Some((&50, &500)));
+    /// 
+    /// # Ok::<(), Error>(())
+    /// ```
     pub fn lower_bound(&self, key: &K) -> Option<(&K, &V)>
     where
         K: Ord,
     {
-        self.neighborhood_search_raw(key, NeighborType::Predecessor, None)
+        self.neighborhood_search_raw(key, NeighborType::Predecessor, NeighborSearchType::SearchKeyFoundReturnsNeighbor)
             .map(|node| unsafe { (&(*node.as_ptr()).key, &(*node.as_ptr()).value) })
     }
 
-    /// Returns the largest node with a key less than the given key,
-    /// or None if all keys are greater than or equal to the given key
+    /// Identical to `lower_bound`, but returns a mutable reference to V
+    /// 
+    /// ```
+    /// use kernel::rbtree::RBTree;
+    /// // Create a new tree.
+    /// let mut tree = RBTree::new();
+    ///
+    /// // Insert five elements.
+    /// tree.try_insert(20, 200)?;
+    /// tree.try_insert(10, 100)?;
+    /// tree.try_insert(30, 300)?;
+    /// tree.try_insert(50, 500)?;
+    /// tree.try_insert(40, 400)?;
+    /// 
+    /// // the returned node can be mutated
+    /// let lower_bound = tree.lower_bound_mut(&25);
+    /// assert_eq!(lower_bound, Some((&20, &mut 200)));
+    /// if let Some((_, v)) = lower_bound {
+    ///     *v = 1000;
+    /// }
+    /// assert_eq!(tree.get(&20), Some(&1000));
+    /// # Ok::<(), Error>(())
+    /// ```
     pub fn lower_bound_mut(&mut self, key: &K) -> Option<(&K, &mut V)>
     where
         K: Ord,
     {
-        self.neighborhood_search_raw(key, NeighborType::Predecessor, None)
+        self.neighborhood_search_raw(key, NeighborType::Predecessor, NeighborSearchType::SearchKeyFoundReturnsNeighbor)
             .map(|node| unsafe { (&(*node.as_ptr()).key, &mut (*node.as_ptr()).value) })
     }
 
@@ -405,7 +461,7 @@ impl<K, V> RBTree<K, V> {
     where
         K: Ord,
     {
-        self.neighborhood_search_raw(key, NeighborType::Successor, None)
+        self.neighborhood_search_raw(key, NeighborType::Successor, NeighborSearchType::SearchKeyFoundReturnsNeighbor)
             .map(|node| unsafe { (&(*node.as_ptr()).key, &(*node.as_ptr()).value) })
     }
 
@@ -415,8 +471,11 @@ impl<K, V> RBTree<K, V> {
     where
         K: Ord,
     {
-        self.neighborhood_search_raw(key, NeighborType::Successor, None)
-            .map(|node| unsafe { (&(*node.as_ptr()).key, &mut (*node.as_ptr()).value) })
+        self.neighborhood_search_raw(
+            key, NeighborType::Successor, 
+            NeighborSearchType::SearchKeyFoundReturnsNeighbor
+        )
+        .map(|node| unsafe { (&(*node.as_ptr()).key, &mut (*node.as_ptr()).value) })
     }
 
     /// Returns the node at the given key or the key's lower bound if it doesn't exist
@@ -427,7 +486,7 @@ impl<K, V> RBTree<K, V> {
         self.neighborhood_search_raw(
             key,
             NeighborType::Predecessor,
-            Some(NeighborhoodSearchType::ReturnSearchKey),
+            NeighborSearchType::SearchKeyFoundIsReturned,
         )
         .map(|node| unsafe { (&(*node.as_ptr()).key, &(*node.as_ptr()).value) })
     }
@@ -440,7 +499,7 @@ impl<K, V> RBTree<K, V> {
         self.neighborhood_search_raw(
             key,
             NeighborType::Predecessor,
-            Some(NeighborhoodSearchType::ReturnSearchKey),
+            NeighborSearchType::SearchKeyFoundIsReturned,
         )
         .map(|node| unsafe { (&(*node.as_ptr()).key, &mut (*node.as_ptr()).value) })
     }
@@ -453,7 +512,7 @@ impl<K, V> RBTree<K, V> {
         self.neighborhood_search_raw(
             key,
             NeighborType::Successor,
-            Some(NeighborhoodSearchType::ReturnSearchKey),
+            NeighborSearchType::SearchKeyFoundIsReturned,
         )
         .map(|node| unsafe { (&(*node.as_ptr()).key, &(*node.as_ptr()).value) })
     }
@@ -466,7 +525,7 @@ impl<K, V> RBTree<K, V> {
         self.neighborhood_search_raw(
             key,
             NeighborType::Successor,
-            Some(NeighborhoodSearchType::ReturnSearchKey),
+            NeighborSearchType::SearchKeyFoundIsReturned,
         )
         .map(|node| unsafe { (&(*node.as_ptr()).key, &mut (*node.as_ptr()).value) })
     }
@@ -481,7 +540,7 @@ impl<K, V> RBTree<K, V> {
         self.neighborhood_search_raw(
             key,
             NeighborType::Predecessor,
-            Some(NeighborhoodSearchType::SearchKeyMustExist),
+            NeighborSearchType::SearchKeyNotFoundReturnsNone,
         )
         .map(|node| unsafe { (&(*node.as_ptr()).key, &(*node.as_ptr()).value) })
     }
@@ -496,7 +555,7 @@ impl<K, V> RBTree<K, V> {
         self.neighborhood_search_raw(
             key,
             NeighborType::Predecessor,
-            Some(NeighborhoodSearchType::SearchKeyMustExist),
+            NeighborSearchType::SearchKeyNotFoundReturnsNone,
         )
         .map(|node| unsafe { (&(*node.as_ptr()).key, &mut (*node.as_ptr()).value) })
     }
@@ -511,7 +570,7 @@ impl<K, V> RBTree<K, V> {
         self.neighborhood_search_raw(
             key,
             NeighborType::Successor,
-            Some(NeighborhoodSearchType::SearchKeyMustExist),
+            NeighborSearchType::SearchKeyNotFoundReturnsNone,
         )
         .map(|node| unsafe { (&(*node.as_ptr()).key, &(*node.as_ptr()).value) })
     }
@@ -526,7 +585,7 @@ impl<K, V> RBTree<K, V> {
         self.neighborhood_search_raw(
             key,
             NeighborType::Successor,
-            Some(NeighborhoodSearchType::SearchKeyMustExist),
+            NeighborSearchType::SearchKeyNotFoundReturnsNone,
         )
         .map(|node| unsafe { (&(*node.as_ptr()).key, &mut (*node.as_ptr()).value) })
     }
@@ -790,9 +849,10 @@ enum NeighborType {
 }
 
 #[derive(PartialEq)]
-enum NeighborhoodSearchType {
-    SearchKeyMustExist,
-    ReturnSearchKey,
+enum NeighborSearchType {
+    SearchKeyFoundReturnsNeighbor,
+    SearchKeyFoundIsReturned,
+    SearchKeyNotFoundReturnsNone,
 }
 
 #[kunit_tests(rbtree)]

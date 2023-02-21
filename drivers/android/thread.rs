@@ -547,9 +547,30 @@ impl Thread {
                 return Ok(Some(work));
             }
 
+            let mut pi_transaction: Option<Ref<Transaction>> = None;
+            if let Some(cur) = inner.current_transaction.as_ref() {
+                if Ref::ptr_eq(&cur.from, self) {
+                    pi_transaction = Some(cur.clone());
+                }
+            }
+
+            if let Some(pi_transaction) = pi_transaction.as_ref() {
+                pi_transaction.pi_node.begin_sleep();
+            }
+
             inner.looper_flags |= LOOPER_WAITING;
             inner.looper_need_return = false;
             let signal_pending = self.work_condvar.wait(&mut inner);
+
+            if let Some(pit) = pi_transaction.as_ref() {
+                // Dropping the lock here is necessary because setting when we run the destructor
+                // of `pi_transaction`, this could take other locks.
+                drop(inner);
+                pit.pi_node.end_sleep();
+                pi_transaction.take();
+                inner = self.inner.lock();
+            }
+
             inner.looper_flags &= !LOOPER_WAITING;
 
             if signal_pending {
@@ -617,27 +638,57 @@ impl Thread {
         }
     }
 
+    /// Called when pushing a transaction to this thread.
+    ///
+    /// The transaction should be "new" in the sense that this thread is not already part of the
+    /// transaction stack. For that case, `push_work` should be used instead.
+    ///
+    /// The difference between the two methods is that this method sets up priority inheritance
+    /// immediately, rather than waiting for the thread to receive the transaction. For
+    /// transactions where priority inheritance is not used (oneshots, replies), it does not matter
+    /// which method is used.
+    pub(crate) fn push_new_transaction(&self, work: Ref<Transaction>) -> BinderResult<bool> {
+        let sync = work.should_sync_wakeup();
+        let mut inner = self.inner.lock();
+        if inner.is_dead {
+            return Err(BinderError::new_dead());
+        }
+        work.set_pi_owner(&self.task);
+        let ty_name = work.debug_name();
+        if !inner.push_work(work) {
+            pr_warn!("Failure: Transaction already pushed to a work list");
+            return Ok(false);
+        }
+        if inner.work_list.is_empty() {
+            pr_warn!("Failure: work_list empty after pushing {}", ty_name);
+            return Ok(false);
+        }
+        if sync {
+            self.work_condvar.notify_sync();
+        } else {
+            self.work_condvar.notify_one();
+        }
+        Ok(true)
+    }
+
     pub(crate) fn push_work(&self, work: Ref<dyn DeliverToRead>) -> BinderResult<bool> {
         let sync = work.should_sync_wakeup();
-        {
-            let mut inner = self.inner.lock();
-            if inner.is_dead {
-                return Err(BinderError::new_dead());
-            }
-            let ty_name = work.debug_name();
-            if !inner.push_work(work) {
-                return Ok(false);
-            }
-            if inner.work_list.is_empty() {
-                pr_warn!("Failure: work_list empty after pushing {}", ty_name);
-                return Ok(false);
-            }
-            if sync {
-                self.work_condvar.notify_sync();
-            } else {
-                self.work_condvar.notify_one();
-            }
-            drop(inner);
+        let mut inner = self.inner.lock();
+        if inner.is_dead {
+            return Err(BinderError::new_dead());
+        }
+        let ty_name = work.debug_name();
+        if !inner.push_work(work) {
+            return Ok(false);
+        }
+        if inner.work_list.is_empty() {
+            pr_warn!("Failure: work_list empty after pushing {}", ty_name);
+            return Ok(false);
+        }
+        if sync {
+            self.work_condvar.notify_sync();
+        } else {
+            self.work_condvar.notify_one();
         }
         Ok(true)
     }
@@ -1087,6 +1138,8 @@ impl Thread {
         if self.deliver_single_reply(reply, transaction) {
             transaction.from.unwind_transaction_stack();
         }
+
+        transaction.set_reply_delivered();
     }
 
     /// Delivers a reply to the thread that started a transaction. The reply can either be a

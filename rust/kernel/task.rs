@@ -89,6 +89,11 @@ impl Task {
         }
     }
 
+    /// Get a raw pointer to this task.
+    pub fn as_raw(&self) -> *mut bindings::task_struct {
+        self.0.get()
+    }
+
     /// Returns the group leader of the given task.
     pub fn group_leader(&self) -> &Task {
         // SAFETY: By the type invariant, we know that `self.0` is valid.

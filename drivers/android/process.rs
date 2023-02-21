@@ -24,6 +24,7 @@ use crate::{
     defs::*,
     node::{DeliveredNodeDeath, Node, NodeDeath, NodeRef},
     range_alloc::RangeAllocator,
+    transaction::Transaction,
     thread::{BinderError, BinderResult, Thread},
     DeliverToRead, DeliverToReadListAdapter,
 };
@@ -104,6 +105,41 @@ impl ProcessInner {
             started_thread_count: 0,
             delivered_deaths: List::new(),
             defer_work: 0,
+        }
+    }
+
+    /// Called when pushing a transaction to this process.
+    ///
+    /// The transaction should be "new" in the sense that this process is not already part of the
+    /// transaction stack. For that case, `push_work` should be used on the appropriate thread
+    /// instead.
+    pub(crate) fn push_new_transaction(&mut self, work: Ref<Transaction>) -> BinderResult {
+        // Try to find a ready thread to which to push the work.
+        if let Some(thread) = self.ready_threads.pop_front() {
+            // Push to thread while holding state lock. This prevents the thread from giving up
+            // (for example, because of a signal) when we're about to deliver work.
+            match thread.push_new_transaction(work) {
+                Ok(success) => {
+                    if !success {
+                        self.ready_threads.push_back(thread);
+                    }
+                    Ok(())
+                },
+                Err(err) => Err(err),
+            }
+        } else if self.is_dead {
+            Err(BinderError::new_dead())
+        } else {
+            let sync = work.should_sync_wakeup();
+
+            // There are no ready threads. Push work to process queue.
+            self.work.push_back(work);
+
+            // Wake up polling threads, if any.
+            for thread in self.threads.values() {
+                thread.notify_if_poll_ready(sync);
+            }
+            Ok(())
         }
     }
 
@@ -461,6 +497,10 @@ impl Process {
 
         inner.threads.insert(node);
         Ok(ta)
+    }
+
+    pub(crate) fn push_new_transaction(&self, work: Ref<Transaction>) -> BinderResult {
+        self.inner.lock().push_new_transaction(work)
     }
 
     pub(crate) fn push_work(&self, work: Ref<dyn DeliverToRead>) -> BinderResult {

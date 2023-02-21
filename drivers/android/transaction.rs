@@ -9,7 +9,7 @@ use kernel::{
     linked_list::{GetLinks, Links},
     prelude::*,
     sync::{Ref, SpinLock, UniqueRef},
-    task::Kuid,
+    task::{Kuid, Task},
     user_ptr::UserSlicePtrWriter,
     Either, ScopeGuard,
 };
@@ -34,6 +34,7 @@ pub(crate) struct Transaction {
     stack_next: Option<Ref<Transaction>>,
     pub(crate) from: Ref<Thread>,
     to: Ref<Process>,
+    pub(crate) pi_node: crate::pi::PINode,
     free_allocation: AtomicBool,
     code: u32,
     pub(crate) flags: u32,
@@ -80,6 +81,8 @@ impl Transaction {
         let mut tr = Pin::from(UniqueRef::try_new(Self {
             // SAFETY: `spinlock_init` is called below.
             inner: unsafe { SpinLock::new(TransactionInner { file_list }) },
+            // SAFETY: `PINode::init` is called below.
+            pi_node: unsafe { crate::pi::PINode::new(&from.task) },
             node_ref: Some(node_ref),
             stack_next,
             from: from.clone(),
@@ -96,8 +99,12 @@ impl Transaction {
         })?);
 
         // SAFETY: `inner` is pinned when `tr` is.
-        let pinned = unsafe { tr.as_mut().map_unchecked_mut(|t| &mut t.inner) };
-        kernel::spinlock_init!(pinned, "Transaction::inner");
+        let inner = unsafe { tr.as_mut().map_unchecked_mut(|t| &mut t.inner) };
+        kernel::spinlock_init!(inner, "Transaction::inner");
+
+        // SAFETY: `pi_node` is pinned when `tr` is.
+        let pi_node = unsafe { tr.as_mut().map_unchecked_mut(|t| &mut t.pi_node) };
+        pi_node.init();
 
         Ok(tr.into())
     }
@@ -125,6 +132,8 @@ impl Transaction {
         let mut tr = Pin::from(UniqueRef::try_new(Self {
             // SAFETY: `spinlock_init` is called below.
             inner: unsafe { SpinLock::new(TransactionInner { file_list }) },
+            // SAFETY: `PINode::init` is called below.
+            pi_node: unsafe { crate::pi::PINode::new(&from.task) },
             node_ref: None,
             stack_next: None,
             from: from.clone(),
@@ -143,6 +152,10 @@ impl Transaction {
         // SAFETY: `inner` is pinned when `tr` is.
         let pinned = unsafe { tr.as_mut().map_unchecked_mut(|t| &mut t.inner) };
         kernel::spinlock_init!(pinned, "Transaction::inner");
+
+        // SAFETY: `pi_node` is pinned when `tr` is.
+        let pi_node = unsafe { tr.as_mut().map_unchecked_mut(|t| &mut t.pi_node) };
+        pi_node.init();
 
         Ok(tr.into())
     }
@@ -204,11 +217,20 @@ impl Transaction {
         }
 
         if let Some(thread) = self.find_target_thread() {
+            // We don't call `set_owner` here because this condition only triggers when we are
+            // sending the transaction to a thread already part of this transaction stack, and the
+            // target thread is probably waiting for *us* on an rtmutex earlier in the transaction
+            // stack. This means that setting the owner now would look like a deadlock to the
+            // rtmutex.
+            //
+            // Instead, we rely on `set_owner` being called by the target thread itself once it has
+            // been woken up and stopped waiting for us.
             thread.push_work(self)?;
+
             Ok(())
         } else {
             let process = self.to.clone();
-            process.push_work(self)
+            process.push_new_transaction(self)
         }
     }
 
@@ -238,6 +260,24 @@ impl Transaction {
 
         Ok(file_list)
     }
+
+    /// Called when assigning the transaction to a thread from the sender.
+    ///
+    /// If the target has no available threads, then this is done inside `do_work` when a thread
+    /// picks it up instead.
+    pub(crate) fn set_pi_owner(&self, owner: &Task) {
+        if self.node_ref.is_some() && self.flags & TF_ONE_WAY == 0 {
+            // Not a reply and not one-way.
+            self.pi_node.set_owner(owner);
+        }
+    }
+
+    /// Called on transactions when a reply has been delivered.
+    ///
+    /// Should be called from the thread that sent the reply, after waking up the sleeping thread.
+    pub(crate) fn set_reply_delivered(&self) {
+        self.pi_node.owner_is_done();
+    }
 }
 
 impl DeliverToRead for Transaction {
@@ -248,6 +288,12 @@ impl DeliverToRead for Transaction {
                 self.from.deliver_reply(reply, &self);
             }
         });
+
+        if self.node_ref.is_some() && self.flags & TF_ONE_WAY == 0 {
+            // Not a reply and not one-way.
+            self.pi_node.set_owner(&Task::current());
+        }
+
         let mut file_list = if let Ok(list) = self.prepare_file_list() {
             list
         } else {

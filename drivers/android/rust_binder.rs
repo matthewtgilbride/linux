@@ -23,6 +23,8 @@ use core::mem::ManuallyDrop;
 
 #[macro_use]
 mod debug;
+#[macro_use]
+mod pi;
 
 mod allocation;
 mod context;

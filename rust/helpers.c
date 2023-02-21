@@ -23,6 +23,7 @@
 #include <linux/build_bug.h>
 #include <linux/clk.h>
 #include <linux/cred.h>
+#include <linux/debug_locks.h>
 #include <linux/errname.h>
 #include <linux/gfp.h>
 #include <linux/highmem.h>
@@ -34,8 +35,10 @@
 #include <linux/netdevice.h>
 #include <linux/of_device.h>
 #include <linux/platform_device.h>
+#include <linux/rtmutex.h>
 #include <linux/sched.h>
 #include <linux/sched/signal.h>
+#include <linux/sched/wake_q.h>
 #include <linux/security.h>
 #include <linux/skbuff.h>
 #include <linux/uaccess.h>

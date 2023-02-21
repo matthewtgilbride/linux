@@ -366,6 +366,87 @@ impl<K, V> RBTree<K, V> {
         }
     }
 
+    /// Returns a cursor over the tree nodes, starting with the smallest key
+    pub fn cursor_front(&mut self) -> Option<RBTreeCursor<'_, K, V>> {
+        let root = addr_of_mut!(self.root);
+        // SAFETY: `self.root` is always a valid root node
+        let current = unsafe { bindings::rb_first(root) };
+        if current.is_null() {
+            return None;
+        }
+        Some(RBTreeCursor {
+            _tree: PhantomData,
+            root,
+            current,
+        })
+    }
+
+    /// Returns a cursor over the tree nodes, starting with the largest key
+    pub fn cursor_back(&mut self) -> Option<RBTreeCursor<'_, K, V>> {
+        let root = addr_of_mut!(self.root);
+        // SAFETY: `self.root` is always a valid root node
+        let current = unsafe { bindings::rb_last(root) };
+        if current.is_null() {
+            return None;
+        }
+        Some(RBTreeCursor {
+            _tree: PhantomData,
+            root,
+            current,
+        })
+    }
+
+    /// Returns a cursor over the tree nodes based on the given key.
+    /// If the given key exists, the cursor starts there.
+    /// Otherwise it starts with the first larger key in sort order.
+    /// If there is no larger key, it returns None
+    pub fn cursor_lower_bound(&mut self, key: &K) -> Option<RBTreeCursor<'_, K, V>>
+    where
+        K: Ord,
+    {
+        let mut node = self.root.rb_node;
+        let mut best_match: Option<NonNull<Node<K, V>>> = None;
+        while !node.is_null() {
+            let this = crate::container_of!(node, Node<K, V>, links) as *mut Node<K, V>;
+            // SAFETY: `this` is a non-null node so it is valid by the type invariants.
+            let this_key = unsafe { &(*this).key };
+            // SAFETY: `node` is a non-null node so it is valid by the type invariants.
+            let left_child = unsafe { (*node).rb_left };
+            // SAFETY: `node` is a non-null node so it is valid by the type invariants.
+            let right_child = unsafe { (*node).rb_right };
+            if key == this_key {
+                return Some(RBTreeCursor {
+                    _tree: PhantomData,
+                    root: addr_of_mut!(self.root),
+                    current: node,
+                });
+            } else {
+                node = if key > this_key {
+                    right_child
+                } else {
+                    let is_better_match = match best_match {
+                        None => true,
+                        Some(best) => {
+                            // SAFETY: `best` is a non-null node so it is valid by the type invariants.
+                            let best_key = unsafe { &(*best.as_ptr()).key };
+                            best_key > this_key
+                        }
+                    };
+                    if is_better_match {
+                        best_match = NonNull::new(this);
+                    }
+                    left_child
+                }
+            };
+        }
+        best_match.map(|best| RBTreeCursor {
+            _tree: PhantomData,
+            root: addr_of_mut!(self.root),
+            // SAFETY: `best` is a non-null node so it is valid by the type invariants.
+            current: unsafe { addr_of_mut!((*best.as_ptr()).links) },
+        })
+    }
+
     /// Returns a mutable iterator over the tree nodes, sorted by key.
     pub fn iter_mut(&mut self) -> RBTreeIteratorMut<'_, K, V> {
         RBTreeIteratorMut {
@@ -416,6 +497,127 @@ impl<K, V> Drop for RBTree<K, V> {
             unsafe { Box::from_raw(this as *mut Node<K, V>) };
         }
     }
+}
+
+/// A bidirectional cursor over the tree nodes, sorted by key
+pub struct RBTreeCursor<'a, K, V> {
+    _tree: PhantomData<&'a RBTree<K, V>>,
+    root: *mut bindings::rb_root,
+    current: *mut bindings::rb_node,
+}
+
+impl<'a, K, V> RBTreeCursor<'a, K, V> {
+    /// The current node, with a mutable value
+    pub fn current(&mut self) -> (&K, &mut V) {
+        self.to_key_value_mut(self.current)
+    }
+
+    /// Removes the current node from the tree.
+    /// Returns a cursor to the next node, if it exists.
+    /// Returns a cursor to the previous node if there is no next node
+    /// Returns None if the current node was the last one in the tree
+    pub fn remove_current(mut self) -> Option<Self> {
+        let prev = self.get_neighbor_raw(Direction::Prev);
+        let next = self.get_neighbor_raw(Direction::Next);
+        let this = crate::container_of!(self.current, Node<K, V>, links) as *mut Node<K, V>;
+        // SAFETY: The reference to the tree used to create the cursor outlives the cursor, so
+        // the tree cannot change. By the tree invariant, all nodes are valid.
+        unsafe { bindings::rb_erase(&mut (*this).links, self.root) };
+
+        let current = match (prev, next) {
+            (_, Some(next)) => next,
+            (Some(prev), None) => prev,
+            (None, None) => {
+                return None;
+            }
+        };
+
+        Some(Self {
+            current,
+            _tree: self._tree,
+            root: self.root,
+        })
+    }
+
+    /// Move the cursor to the previous node,
+    /// returning None if it doesn't exist
+    pub fn prev(mut self) -> Option<Self> {
+        self.mv(Direction::Prev)
+    }
+
+    /// Move the cursor to the next node,
+    /// returning None if it doesn't exist
+    pub fn next(mut self) -> Option<Self> {
+        self.mv(Direction::Next)
+    }
+
+    fn mv(&mut self, direction: Direction) -> Option<Self> {
+        self.get_neighbor_raw(direction).map(|neighbor| Self {
+            _tree: self._tree,
+            root: self.root,
+            current: neighbor,
+        })
+    }
+
+    /// Access the previous node without moving the cursor
+    pub fn peek_prev(&mut self) -> Option<(&K, &mut V)> {
+        self.peek(Direction::Prev)
+    }
+
+    /// Access the next node without moving the cursor
+    pub fn peek_next(&mut self) -> Option<(&K, &mut V)> {
+        self.peek(Direction::Next)
+    }
+
+    fn peek(&mut self, direction: Direction) -> Option<(&K, &mut V)> {
+        // SAFETY: `self.current` is a non-null node so it is valid by the type invariants.
+        let neighbor = unsafe {
+            match direction {
+                Direction::Prev => bindings::rb_prev(self.current),
+                Direction::Next => bindings::rb_next(self.current),
+            }
+        };
+
+        if neighbor.is_null() {
+            return None;
+        }
+
+        Some(self.to_key_value_mut(neighbor))
+    }
+
+    fn get_neighbor_raw(&mut self, direction: Direction) -> Option<*mut bindings::rb_node> {
+        // SAFETY: `self.current` is a non-null node so it is valid by the type invariants.
+        let neighbor = unsafe {
+            match direction {
+                Direction::Prev => bindings::rb_prev(self.current),
+                Direction::Next => bindings::rb_next(self.current),
+            }
+        };
+
+        if neighbor.is_null() {
+            return None;
+        }
+
+        return Some(neighbor);
+    }
+
+    // SAFETY: this internal method should ONLY be called with a valid pointer to a node
+    fn to_key_value_mut(&mut self, node: *mut bindings::rb_node) -> (&'a K, &'a mut V) {
+        let this = crate::container_of!(node, Node<K, V>, links) as *mut Node<K, V>;
+        // SAFETY: `this` is a non-null node so it is valid by the type invariants.
+        let k = unsafe { &(*this).key };
+        // SAFETY: `this` is a non-null node so it is valid by the type invariants.
+        let v = unsafe { &mut (*this).value };
+        (k, v)
+    }
+}
+
+/// Direction for `RBTreeCursor` operations
+enum Direction {
+    /// the node immediately before, in sort order
+    Prev,
+    /// the node immediately after, in sort order
+    Next,
 }
 
 impl<'a, K, V> IntoIterator for &'a RBTree<K, V> {

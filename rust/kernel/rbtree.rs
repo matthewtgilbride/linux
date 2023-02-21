@@ -22,6 +22,18 @@ struct Node<K, V> {
     value: V,
 }
 
+enum NeighborType {
+    Predecessor,
+    Successor,
+}
+
+#[derive(PartialEq)]
+enum NeighborSearchType {
+    SearchKeyFoundReturnsNeighbor,
+    SearchKeyFoundIsReturned,
+    SearchKeyNotFoundReturnsNone,
+}
+
 /// A red-black tree with owned nodes.
 ///
 /// It is backed by the kernel C red-black trees.
@@ -438,7 +450,7 @@ impl<K, V> RBTree<K, V> {
     /// tree.try_insert(50, 500)?;
     /// tree.try_insert(40, 400)?;
     /// 
-    /// // the returned node can be mutated
+    /// // the returned `lower_bound` node can be mutated
     /// let lower_bound = tree.lower_bound_mut(&25);
     /// assert_eq!(lower_bound, Some((&20, &mut 200)));
     /// if let Some((_, v)) = lower_bound {
@@ -457,6 +469,42 @@ impl<K, V> RBTree<K, V> {
 
     /// Returns the smallest node with a key greater than the given key,
     /// or None of all keys are less than or equal to the given key
+    /// 
+    /// 
+    /// ```
+    /// use kernel::rbtree::RBTree;
+    /// // Create a new tree.
+    /// let mut tree = RBTree::new();
+    ///
+    /// // Insert five elements.
+    /// tree.try_insert(20, 200)?;
+    /// tree.try_insert(10, 100)?;
+    /// tree.try_insert(30, 300)?;
+    /// tree.try_insert(50, 500)?;
+    /// tree.try_insert(40, 400)?;
+    /// 
+    /// // `upper_bound` of an existent key returns it's successor
+    /// let mut upper_bound = tree.upper_bound(&30);
+    /// assert_eq!(upper_bound, Some((&40, &400)));
+    /// 
+    /// // `upper_bound` of a non-existent key returns the smallest node with a key larger than the given key
+    /// upper_bound = tree.upper_bound(&35);
+    /// assert_eq!(upper_bound, Some((&40, &400)));
+    /// 
+    /// // `upper_bound` of the largest key returns None
+    /// upper_bound = tree.upper_bound(&50);
+    /// assert_eq!(upper_bound, None);
+    /// 
+    /// // `upper_bound` of a key larger than the largest key returns None
+    /// upper_bound = tree.upper_bound(&55);
+    /// assert_eq!(upper_bound, None);
+    /// 
+    /// // `upper_bound` of a key smaller than smallest key returns the the smallest node
+    /// upper_bound = tree.upper_bound(&5);
+    /// assert_eq!(upper_bound, Some((&10, &100)));
+    /// 
+    /// # Ok::<(), Error>(())
+    /// ```
     pub fn upper_bound(&self, key: &K) -> Option<(&K, &V)>
     where
         K: Ord,
@@ -465,8 +513,29 @@ impl<K, V> RBTree<K, V> {
             .map(|node| unsafe { (&(*node.as_ptr()).key, &(*node.as_ptr()).value) })
     }
 
-    /// Returns the smallest node with a key greater than the given key,
-    /// or None of all keys are less than or equal to the given key
+    /// Identical to `upper_bound`, but returns a mutable reference to V
+    /// 
+    /// ```
+    /// use kernel::rbtree::RBTree;
+    /// // Create a new tree.
+    /// let mut tree = RBTree::new();
+    ///
+    /// // Insert five elements.
+    /// tree.try_insert(20, 200)?;
+    /// tree.try_insert(10, 100)?;
+    /// tree.try_insert(30, 300)?;
+    /// tree.try_insert(50, 500)?;
+    /// tree.try_insert(40, 400)?;
+    /// 
+    /// // the returned `lower_bound` node can be mutated
+    /// let upper_bound = tree.upper_bound_mut(&35);
+    /// assert_eq!(upper_bound, Some((&40, &mut 400)));
+    /// if let Some((_, v)) = upper_bound {
+    ///     *v = 1000;
+    /// }
+    /// assert_eq!(tree.get(&40), Some(&1000));
+    /// # Ok::<(), Error>(())
+    /// ```
     pub fn upper_bound_mut(&mut self, key: &K) -> Option<(&K, &mut V)>
     where
         K: Ord,
@@ -478,7 +547,42 @@ impl<K, V> RBTree<K, V> {
         .map(|node| unsafe { (&(*node.as_ptr()).key, &mut (*node.as_ptr()).value) })
     }
 
-    /// Returns the node at the given key or the key's lower bound if it doesn't exist
+    /// Returns the node at the given key, or the key's `lower_bound` if it doesn't exist
+    /// 
+    /// ```
+    /// use kernel::rbtree::RBTree;
+    /// // Create a new tree.
+    /// let mut tree = RBTree::new();
+    ///
+    /// // Insert five elements.
+    /// tree.try_insert(20, 200)?;
+    /// tree.try_insert(10, 100)?;
+    /// tree.try_insert(30, 300)?;
+    /// tree.try_insert(50, 500)?;
+    /// tree.try_insert(40, 400)?;
+    /// 
+    /// // `get_or_lower_bound` of an existent key returns the given key's node
+    /// let mut get_or_lower_bound = tree.get_or_lower_bound(&30);
+    /// assert_eq!(get_or_lower_bound, Some((&30, &300)));
+    /// 
+    /// // `get_or_lower_bound` of a non-existent key returns the largest node with a key smaller than the given key
+    /// get_or_lower_bound = tree.get_or_lower_bound(&25);
+    /// assert_eq!(get_or_lower_bound, Some((&20, &200)));
+    /// 
+    /// // `get_or_lower_bound` of the smallest key returns the smallest key's node
+    /// get_or_lower_bound = tree.get_or_lower_bound(&10);
+    ///  assert_eq!(get_or_lower_bound, Some((&10, &100)));
+    /// 
+    /// // `get_or_lower_bound` of a key smaller than the smallest key returns None
+    /// get_or_lower_bound = tree.get_or_lower_bound(&5);
+    /// assert_eq!(get_or_lower_bound, None);
+    /// 
+    /// // `get_or_lower_bound` of a key larger than largest key returns the the largest node
+    /// get_or_lower_bound = tree.get_or_lower_bound(&55);
+    /// assert_eq!(get_or_lower_bound, Some((&50, &500)));
+    /// 
+    /// # Ok::<(), Error>(())
+    /// ```
     pub fn get_or_lower_bound(&self, key: &K) -> Option<(&K, &V)>
     where
         K: Ord,
@@ -533,6 +637,33 @@ impl<K, V> RBTree<K, V> {
     /// Returns the predecessor of a node at the given key
     /// - None if a node at the given key doesn't exist
     /// - None if the node at the given key is first in sort order
+    /// 
+    /// ```
+    /// use kernel::rbtree::RBTree;
+    /// // Create a new tree.
+    /// let mut tree = RBTree::new();
+    ///
+    /// // Insert five elements.
+    /// tree.try_insert(20, 200)?;
+    /// tree.try_insert(10, 100)?;
+    /// tree.try_insert(30, 300)?;
+    /// tree.try_insert(50, 500)?;
+    /// tree.try_insert(40, 400)?;
+    /// 
+    /// // `predecessor` of an existent key returns the given key's predecessor
+    /// let mut predecessor = tree.predecessor(&30);
+    /// assert_eq!(predecessor, Some((&20, &200)));
+    /// 
+    /// // `predecessor` of a non-existent key returns None
+    /// predecessor = tree.predecessor(&25);
+    /// assert_eq!(predecessor, None);
+    /// 
+    /// // `predecessor` of the smallest key returns None
+    /// predecessor = tree.predecessor(&10);
+    ///  assert_eq!(predecessor, None);
+    /// 
+    /// # Ok::<(), Error>(())
+    /// ```
     pub fn predecessor(&self, key: &K) -> Option<(&K, &V)>
     where
         K: Ord,
@@ -840,121 +971,5 @@ impl<K, V> RBTreeNode<K, V> {
         // because it came from a `Node`. So it is safe to drop it.
         unsafe { core::ptr::drop_in_place(ret.node.as_mut_ptr()) };
         ret
-    }
-}
-
-enum NeighborType {
-    Predecessor,
-    Successor,
-}
-
-#[derive(PartialEq)]
-enum NeighborSearchType {
-    SearchKeyFoundReturnsNeighbor,
-    SearchKeyFoundIsReturned,
-    SearchKeyNotFoundReturnsNone,
-}
-
-#[kunit_tests(rbtree)]
-mod tests {
-    use crate::rbtree::RBTree;
-
-    #[test]
-    fn upper_bound() {
-        let tree = get_test_tree();
-        assert_eq!(tree.upper_bound(&45), Some((&50, &50)));
-    }
-
-    #[test]
-    fn upper_bound_of_exact_match() {
-        let tree = get_test_tree();
-        assert_eq!(tree.upper_bound(&50), Some((&60, &60)));
-    }
-
-    #[test]
-    fn upper_bound_of_less_than_head_is_head() {
-        let tree = get_test_tree();
-        assert_eq!(tree.upper_bound(&5), Some((&10, &10)));
-    }
-
-    #[test]
-    fn upper_bound_of_greater_than_tail_is_none() {
-        let tree = get_test_tree();
-        assert_eq!(tree.upper_bound(&110), None);
-    }
-
-    #[test]
-    fn lower_bound() {
-        let tree = get_test_tree();
-        assert_eq!(tree.lower_bound(&55), Some((&50, &50)));
-    }
-
-    #[test]
-    fn lower_bound_of_exact_match() {
-        let tree = get_test_tree();
-        assert_eq!(tree.lower_bound(&50), Some((&40, &40)));
-    }
-
-    #[test]
-    fn lower_bound_of_less_than_head_is_none() {
-        let tree = get_test_tree();
-        assert_eq!(tree.lower_bound(&5), None);
-    }
-
-    #[test]
-    fn lower_bound_of_greater_than_tail_is_tail() {
-        let tree = get_test_tree();
-        assert_eq!(tree.lower_bound(&110), Some((&100, &100)));
-    }
-
-    #[test]
-    fn predecessor() {
-        let tree = get_test_tree();
-        assert_eq!(tree.predecessor(&50), Some((&40, &40)));
-    }
-
-    #[test]
-    fn predecessor_of_unknown_key_is_none() {
-        let tree = get_test_tree();
-        assert_eq!(tree.predecessor(&45), None);
-    }
-
-    #[test]
-    fn predecessor_of_head_is_none() {
-        let tree = get_test_tree();
-        assert_eq!(tree.predecessor(&10), None);
-    }
-
-    #[test]
-    fn successor() {
-        let tree = get_test_tree();
-        assert_eq!(tree.successor(&50), Some((&60, &60)));
-    }
-
-    #[test]
-    fn successor_of_unknown_key_is_none() {
-        let tree = get_test_tree();
-        assert_eq!(tree.successor(&45), None);
-    }
-
-    #[test]
-    fn successor_of_tail_is_none() {
-        let tree = get_test_tree();
-        assert_eq!(tree.successor(&100), None);
-    }
-
-    fn get_test_tree() -> RBTree<u32, u32> {
-        let mut tree = RBTree::new();
-        tree.try_insert(10, 10).unwrap();
-        tree.try_insert(20, 20).unwrap();
-        tree.try_insert(30, 30).unwrap();
-        tree.try_insert(40, 40).unwrap();
-        tree.try_insert(50, 50).unwrap();
-        tree.try_insert(60, 60).unwrap();
-        tree.try_insert(70, 70).unwrap();
-        tree.try_insert(80, 80).unwrap();
-        tree.try_insert(90, 90).unwrap();
-        tree.try_insert(100, 100).unwrap();
-        tree
     }
 }

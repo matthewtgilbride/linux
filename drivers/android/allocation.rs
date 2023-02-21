@@ -233,7 +233,7 @@ impl<'a, 'b> AllocationView<'a, 'b> {
 
             // Increment the user ref count on the node. It will be decremented as part of the
             // destruction of the buffer, when we see a binder or weak-binder object.
-            node_ref.node.update_refcount(true, strong);
+            node_ref.node.update_refcount(true, 1, strong);
         } else {
             // The receiving process is different from the owner, so we need to insert a handle to
             // the binder object.
@@ -279,7 +279,7 @@ impl<'a, 'b> AllocationView<'a, 'b> {
                 // populated.
                 let ptr = unsafe { obj.__bindgen_anon_1.binder } as usize;
                 let cookie = obj.cookie as usize;
-                self.alloc.process.update_node(ptr, cookie, strong, false);
+                self.alloc.process.update_node(ptr, cookie, strong);
                 Ok(())
             }
             BINDER_TYPE_WEAK_HANDLE | BINDER_TYPE_HANDLE => {

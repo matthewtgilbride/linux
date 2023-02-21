@@ -20,7 +20,6 @@ use crate::{
 struct CountState {
     count: usize,
     has_count: bool,
-    is_biased: bool,
 }
 
 impl CountState {
@@ -28,13 +27,7 @@ impl CountState {
         Self {
             count: 0,
             has_count: false,
-            is_biased: false,
         }
-    }
-
-    fn add_bias(&mut self) {
-        self.count += 1;
-        self.is_biased = true;
     }
 }
 
@@ -44,6 +37,10 @@ struct NodeInner {
     death_list: List<Ref<NodeDeath>>,
     oneway_todo: List<DeliverToReadListAdapter>,
     has_pending_oneway_todo: bool,
+    /// The number of active BR_INCREFS or BR_ACQUIRE acquire operations. (should be maximum two)
+    ///
+    /// We can never submit a BR_RELEASE or BR_DECREFS while this is non-zero.
+    active_inc_refs: u8,
 }
 
 pub(crate) struct Node {
@@ -67,6 +64,7 @@ impl Node {
                 death_list: List::new(),
                 oneway_todo: List::new(),
                 has_pending_oneway_todo: false,
+                active_inc_refs: 0,
             },
         );
         Self {
@@ -99,11 +97,42 @@ impl Node {
         self.inner.access_mut(guard).death_list.push_back(death);
     }
 
+    pub(crate) fn inc_ref_done_locked(
+        &self,
+        _strong: bool,
+        owner_inner: &mut ProcessInner,
+    ) -> bool {
+        let inner = self.inner.access_from_mut(owner_inner);
+        if inner.active_inc_refs == 0 {
+            pr_err!("inc_ref_done called when no active inc_refs");
+            return false;
+        }
+
+        inner.active_inc_refs -= 1;
+        if inner.active_inc_refs == 0 {
+            // Having active inc_refs can inhibit dropping of ref-counts. Calculate whether we
+            // would send a refcount decrement, and if so, tell the caller to schedule us.
+            let strong = inner.strong.count > 0;
+            let has_strong = inner.strong.has_count;
+            let weak = strong || inner.weak.count > 0;
+            let has_weak = inner.weak.has_count;
+
+            let should_drop_weak = !weak && has_weak;
+            let should_drop_strong = !strong && has_strong;
+
+            // If we want to drop the ref-count again, tell the caller to schedule a work node for
+            // that.
+            should_drop_weak || should_drop_strong
+        } else {
+            false
+        }
+    }
+
     pub(crate) fn update_refcount_locked(
         &self,
         inc: bool,
         strong: bool,
-        biased: bool,
+        count: usize,
         owner_inner: &mut ProcessInner,
     ) -> bool {
         let inner = self.inner.access_from_mut(owner_inner);
@@ -115,34 +144,28 @@ impl Node {
             &mut inner.weak
         };
 
-        // Update biased state: if the count is not biased, there is nothing to do; otherwise,
-        // we're removing the bias, so mark the state as such.
-        if biased {
-            if !state.is_biased {
-                return false;
-            }
-
-            state.is_biased = false;
-        }
-
         // Update the count and determine whether we need to push work.
         // TODO: Here we may want to check the weak count being zero but the strong count being 1,
         // because in such cases, we won't deliver anything to userspace, so we shouldn't queue
         // either.
         if inc {
-            state.count += 1;
+            state.count += count;
             !state.has_count
         } else {
-            state.count -= 1;
+            if state.count < count {
+                pr_err!("Failure: refcount underflow!");
+                return false;
+            }
+            state.count -= count;
             state.count == 0 && state.has_count
         }
     }
 
-    pub(crate) fn update_refcount(self: &Ref<Self>, inc: bool, strong: bool) {
+    pub(crate) fn update_refcount(self: &Ref<Self>, inc: bool, count: usize, strong: bool) {
         self.owner
             .inner
             .lock()
-            .update_node_refcount(self, inc, strong, false, None);
+            .update_node_refcount(self, inc, strong, count, None);
     }
 
     pub(crate) fn populate_counts(
@@ -228,31 +251,39 @@ impl Node {
 impl DeliverToRead for Node {
     fn do_work(self: Ref<Self>, _thread: &Thread, writer: &mut UserSlicePtrWriter) -> Result<bool> {
         let mut owner_inner = self.owner.inner.lock();
-        let inner = self.inner.access_mut(&mut owner_inner);
+        let mut inner = self.inner.access_mut(&mut owner_inner);
         let strong = inner.strong.count > 0;
         let has_strong = inner.strong.has_count;
         let weak = strong || inner.weak.count > 0;
         let has_weak = inner.weak.has_count;
-        inner.weak.has_count = weak;
-        inner.strong.has_count = strong;
 
-        if !weak {
+        if weak && !has_weak {
+            inner.weak.has_count = true;
+            inner.active_inc_refs += 1;
+        }
+
+        if strong && !has_strong {
+            inner.strong.has_count = true;
+            inner.active_inc_refs += 1;
+        }
+
+        let no_active_inc_refs = inner.active_inc_refs == 0;
+        let should_drop_weak = no_active_inc_refs && (!weak && has_weak);
+        let should_drop_strong = no_active_inc_refs && (!strong && has_strong);
+        if should_drop_weak {
+            inner.weak.has_count = false;
+        }
+        if should_drop_strong {
+            inner.strong.has_count = false;
+        }
+
+        if no_active_inc_refs && !weak {
             // Remove the node if there are no references to it.
             owner_inner.remove_node(self.ptr);
-        } else {
-            if !has_weak {
-                inner.weak.add_bias();
-            }
-
-            if !has_strong && strong {
-                inner.strong.add_bias();
-            }
         }
 
         drop(owner_inner);
 
-        // This could be done more compactly but we write out all the posibilities for
-        // compatibility with the original implementation wrt the order of events.
         if weak && !has_weak {
             self.write(writer, BR_INCREFS)?;
         }
@@ -261,11 +292,11 @@ impl DeliverToRead for Node {
             self.write(writer, BR_ACQUIRE)?;
         }
 
-        if !strong && has_strong {
+        if should_drop_strong {
             self.write(writer, BR_RELEASE)?;
         }
 
-        if !weak && has_weak {
+        if should_drop_weak {
             self.write(writer, BR_DECREFS)?;
         }
 
@@ -283,6 +314,10 @@ impl DeliverToRead for Node {
 
 pub(crate) struct NodeRef {
     pub(crate) node: Ref<Node>,
+    /// How many times does this NodeRef hold a refcount on the Node?
+    strong_node_count: usize,
+    weak_node_count: usize,
+    /// How many times does userspace hold a refcount on this NodeRef?
     strong_count: usize,
     weak_count: usize,
 }
@@ -291,16 +326,24 @@ impl NodeRef {
     pub(crate) fn new(node: Ref<Node>, strong_count: usize, weak_count: usize) -> Self {
         Self {
             node,
+            strong_node_count: strong_count,
+            weak_node_count: weak_count,
             strong_count,
             weak_count,
         }
     }
 
     pub(crate) fn absorb(&mut self, mut other: Self) {
+        assert!(Ref::ptr_eq(&self.node, &other.node), "absorb called with differing nodes");
+
+        self.strong_node_count += other.strong_node_count;
+        self.weak_node_count += other.weak_node_count;
         self.strong_count += other.strong_count;
         self.weak_count += other.weak_count;
         other.strong_count = 0;
         other.weak_count = 0;
+        other.strong_node_count = 0;
+        other.weak_node_count = 0;
     }
 
     pub(crate) fn clone(&self, strong: bool) -> BinderResult<NodeRef> {
@@ -326,21 +369,23 @@ impl NodeRef {
             return false;
         }
 
-        let (count, other_count) = if strong {
-            (&mut self.strong_count, self.weak_count)
+        let (count, node_count, other_count) = if strong {
+            (&mut self.strong_count, &mut self.strong_node_count, self.weak_count)
         } else {
-            (&mut self.weak_count, self.strong_count)
+            (&mut self.weak_count, &mut self.weak_node_count, self.strong_count)
         };
 
         if inc {
             if *count == 0 {
-                self.node.update_refcount(true, strong);
+                *node_count = 1;
+                self.node.update_refcount(true, 1, strong);
             }
             *count += 1;
         } else {
             *count -= 1;
             if *count == 0 {
-                self.node.update_refcount(false, strong);
+                self.node.update_refcount(false, *node_count, strong);
+                *node_count = 0;
                 return other_count == 0;
             }
         }
@@ -351,12 +396,12 @@ impl NodeRef {
 
 impl Drop for NodeRef {
     fn drop(&mut self) {
-        if self.strong_count > 0 {
-            self.node.update_refcount(false, true);
+        if self.strong_node_count > 0 {
+            self.node.update_refcount(false, self.strong_node_count, true);
         }
 
-        if self.weak_count > 0 {
-            self.node.update_refcount(false, false);
+        if self.weak_node_count > 0 {
+            self.node.update_refcount(false, self.weak_node_count, false);
         }
     }
 }

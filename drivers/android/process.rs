@@ -185,10 +185,10 @@ impl ProcessInner {
         node: &Ref<Node>,
         inc: bool,
         strong: bool,
-        biased: bool,
+        count: usize,
         othread: Option<&Thread>,
     ) {
-        let push = node.update_refcount_locked(inc, strong, biased, self);
+        let push = node.update_refcount_locked(inc, strong, count, self);
 
         // If we decided that we need to push work, push either to the process or to a thread if
         // one is specified.
@@ -210,7 +210,7 @@ impl ProcessInner {
         strong: bool,
         thread: Option<&Thread>,
     ) -> NodeRef {
-        self.update_node_refcount(&node, true, strong, false, thread);
+        self.update_node_refcount(&node, true, strong, 1, thread);
         let strong_count = if strong { 1 } else { 0 };
         NodeRef::new(node, strong_count, 1 - strong_count)
     }
@@ -675,17 +675,22 @@ impl Process {
     }
 
     /// Decrements the refcount of the given node, if one exists.
-    pub(crate) fn update_node(&self, ptr: usize, cookie: usize, strong: bool, biased: bool) {
+    pub(crate) fn update_node(&self, ptr: usize, cookie: usize, strong: bool) {
         let mut inner = self.inner.lock();
         if let Ok(Some(node)) = inner.get_existing_node(ptr, cookie) {
-            inner.update_node_refcount(&node, false, strong, biased, None);
+            inner.update_node_refcount(&node, false, strong, 1, None);
         }
     }
 
     pub(crate) fn inc_ref_done(&self, reader: &mut UserSlicePtrReader, strong: bool) -> Result {
         let ptr = reader.read::<usize>()?;
         let cookie = reader.read::<usize>()?;
-        self.update_node(ptr, cookie, strong, true);
+        let mut inner = self.inner.lock();
+        if let Ok(Some(node)) = inner.get_existing_node(ptr, cookie) {
+            if node.inc_ref_done_locked(strong, &mut inner) {
+                let _ = inner.push_work(node);
+            }
+        }
         Ok(())
     }
 

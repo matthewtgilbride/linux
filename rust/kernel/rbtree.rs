@@ -7,7 +7,7 @@
 //! Reference: <https://www.kernel.org/doc/html/latest/core-api/rbtree.html>
 
 use crate::{bindings, macros::kunit_tests, Result};
-use alloc::boxed::Box;
+use alloc::{borrow::ToOwned, boxed::Box};
 use core::{
     cmp::{Ord, Ordering},
     iter::{IntoIterator, Iterator},
@@ -301,128 +301,174 @@ impl<K, V> RBTree<K, V> {
         None
     }
 
-    /// Returns the smallest node with a key greater than the given key,
-    /// or None of all keys are less than or equal to the given key
-    fn upper_bound_raw(&self, key: &K, return_equal: bool) -> Option<NonNull<Node<K,V>>>
+    fn neighborhood_search_raw(
+        &self,
+        search_key: &K,
+        neighbor_type: NeighborType,
+        search_type: Option<NeighborhoodSearchType>,
+    ) -> Option<NonNull<Node<K, V>>>
     where
         K: Ord,
     {
         let mut node = self.root.rb_node;
-        let mut best_match: Option<*mut Node<K, V>> = None;
+        let mut exact_match_found = false;
+        let mut best_match: Option<NonNull<Node<K, V>>> = None;
         while !node.is_null() {
-            let candidate = crate::container_of!(node, Node<K, V>, links) as *mut Node<K, V>;
-            // SAFETY: `candidate` is a non-null node so it is valid by the type invariants.
-            let candidate_key = unsafe { &(*candidate).key };
+            let this = crate::container_of!(node, Node<K, V>, links) as *mut Node<K, V>;
+            // SAFETY: `this` is a non-null node so it is valid by the type invariants.
+            let this_key = unsafe { &(*this).key };
             // SAFETY: `node` is a non-null node so it is valid by the type invariants.
             let left_child = unsafe { (*node).rb_left };
             // SAFETY: `node` is a non-null node so it is valid by the type invariants.
             let right_child = unsafe { (*node).rb_right };
-            node = match key.cmp(candidate_key) {
-                Ordering::Equal => {
-                    best_match = Some(candidate);
-                    break;
+
+            node = if search_key == this_key {
+                exact_match_found = true;
+                if search_type == Some(NeighborhoodSearchType::ReturnSearchKey) {
+                    return NonNull::new(this);
                 }
-                Ordering::Greater => right_child,
-                Ordering::Less => {
-                    let is_better_match = match best_match {
-                        None => true,
-                        Some(current_best) => {
-                            let current_best_key = unsafe { &(*current_best).key };
-                            current_best_key > candidate_key
-                        },
-                    };
-                    if is_better_match {
-                        best_match = Some(candidate);
-                    };
-                    left_child
+
+                match neighbor_type {
+                    NeighborType::Successor => right_child,
+                    NeighborType::Predecessor => left_child,
                 }
-            }
+            } else {
+                match neighbor_type {
+                    NeighborType::Successor => {
+                        if search_key > this_key {
+                            right_child
+                        } else {
+                            let is_better_match = match best_match {
+                                None => true,
+                                Some(best) => {
+                                    // SAFETY: `best` is a non-null node so it is valid by the type invariants.
+                                    let best_key = unsafe { &(*best.as_ptr()).key };
+                                    best_key > this_key
+                                }
+                            };
+                            if is_better_match {
+                                best_match = NonNull::new(this);
+                            }
+                            left_child
+                        }
+                    }
+                    NeighborType::Predecessor => {
+                        if search_key < this_key {
+                            left_child
+                        } else {
+                            let is_better_match = match best_match {
+                                None => true,
+                                Some(best) => {
+                                    // SAFETY: `best` is a non-null node so it is valid by the type invariants.
+                                    let best_key = unsafe { &(*best.as_ptr()).key };
+                                    best_key < this_key
+                                }
+                            };
+                            if is_better_match {
+                                best_match = NonNull::new(this);
+                            }
+                            right_child
+                        }
+                    }
+                }
+            };
         }
-        best_match.and_then(|node| NonNull::new(node))
+        if search_type == Some(NeighborhoodSearchType::SearchKeyMustExist) && !exact_match_found {
+            return None;
+        }
+        best_match
+    }
+
+    /// Returns the largest node with a key less than the given key,
+    /// or None if all keys are greater than or equal to the given key
+    pub fn lower_bound(&self, key: &K) -> Option<(&K, &V)>
+    where
+        K: Ord,
+    {
+        self.neighborhood_search_raw(key, NeighborType::Predecessor, None)
+            .map(|node| unsafe { (&(*node.as_ptr()).key, &(*node.as_ptr()).value) })
+    }
+
+    /// Returns the largest node with a key less than the given key,
+    /// or None if all keys are greater than or equal to the given key
+    pub fn lower_bound_mut(&mut self, key: &K) -> Option<(&K, &mut V)>
+    where
+        K: Ord,
+    {
+        self.neighborhood_search_raw(key, NeighborType::Predecessor, None)
+            .map(|node| unsafe { (&(*node.as_ptr()).key, &mut (*node.as_ptr()).value) })
     }
 
     /// Returns the smallest node with a key greater than the given key,
     /// or None of all keys are less than or equal to the given key
-    pub fn upper_bound(&self, key: &K, return_equal: bool) -> Option<(&K, &V)>
+    pub fn upper_bound(&self, key: &K) -> Option<(&K, &V)>
     where
         K: Ord,
     {
-        self.upper_bound_raw(key, return_equal).map(|node| unsafe {
-            (&(*node.as_ptr()).key, &(*node.as_ptr()).value)
-        })
+        self.neighborhood_search_raw(key, NeighborType::Successor, None)
+            .map(|node| unsafe { (&(*node.as_ptr()).key, &(*node.as_ptr()).value) })
     }
 
     /// Returns the smallest node with a key greater than the given key,
     /// or None of all keys are less than or equal to the given key
-    pub fn upper_bound_mut(&mut self, key: &K, return_equal: bool) -> Option<(&K, &mut V)>
+    pub fn upper_bound_mut(&mut self, key: &K) -> Option<(&K, &mut V)>
     where
         K: Ord,
     {
-        self.upper_bound_raw(key, return_equal).map(|node| unsafe {
-            (&(*node.as_ptr()).key, &mut (*node.as_ptr()).value)
-        })
+        self.neighborhood_search_raw(key, NeighborType::Successor, None)
+            .map(|node| unsafe { (&(*node.as_ptr()).key, &mut (*node.as_ptr()).value) })
     }
 
-    /// Returns the largest node with a key less than the given key,
-    /// or None if all keys are greater than or equal to the given key
-    fn lower_bound_raw(&self, key: &K, return_equal: bool) -> Option<NonNull<Node<K,V>>>
+    /// Returns the node at the given key or the key's lower bound if it doesn't exist
+    pub fn get_or_lower_bound(&self, key: &K) -> Option<(&K, &V)>
     where
         K: Ord,
     {
-        let mut node = self.root.rb_node;
-        let mut best_match: Option<*mut Node<K, V>> = None;
-        while !node.is_null() {
-            let candidate = crate::container_of!(node, Node<K, V>, links) as *mut Node<K, V>;
-            // SAFETY: `candidate` is a non-null node so it is valid by the type invariants.
-            let candidate_key = unsafe { &(*candidate).key };
-            // SAFETY: `node` is a non-null node so it is valid by the type invariants.
-            let left_child = unsafe { (*node).rb_left };
-            // SAFETY: `node` is a non-null node so it is valid by the type invariants.
-            let right_child = unsafe { (*node).rb_right };
-            node = match key.cmp(candidate_key) {
-                Ordering::Equal => {
-                    best_match = Some(candidate);
-                    break;
-                },
-                Ordering::Less => left_child,
-                Ordering::Greater => {
-                    let is_better_match = match best_match {
-                        None => true,
-                        Some(current_best) => {
-                            let current_best_key = unsafe { &(*current_best).key };
-                            current_best_key < candidate_key
-                        },
-                    };
-                    if is_better_match {
-                        best_match = Some(candidate);
-                    };
-                    right_child
-                }
-            }
-        }
-        best_match.and_then(|node| NonNull::new(node))
+        self.neighborhood_search_raw(
+            key,
+            NeighborType::Predecessor,
+            Some(NeighborhoodSearchType::ReturnSearchKey),
+        )
+        .map(|node| unsafe { (&(*node.as_ptr()).key, &(*node.as_ptr()).value) })
     }
 
-    /// Returns the largest node with a key less than the given key,
-    /// or None if all keys are greater than or equal to the given key
-    pub fn lower_bound(&self, key: &K, return_equal: bool) -> Option<(&K, &V)>
+    /// Returns the node at the given key or the key's lower bound if it doesn't exist
+    pub fn get_or_lower_bound_mut(&mut self, key: &K) -> Option<(&K, &mut V)>
     where
         K: Ord,
     {
-        self.lower_bound_raw(key, return_equal).map(|node| unsafe {
-            (&(*node.as_ptr()).key, &(*node.as_ptr()).value)
-        })
+        self.neighborhood_search_raw(
+            key,
+            NeighborType::Predecessor,
+            Some(NeighborhoodSearchType::ReturnSearchKey),
+        )
+        .map(|node| unsafe { (&(*node.as_ptr()).key, &mut (*node.as_ptr()).value) })
     }
 
-    /// Returns the largest node with a key less than the given key,
-    /// or None if all keys are greater than or equal to the given key
-    pub fn lower_bound_mut(&mut self, key: &K, return_equal: bool) -> Option<(&K, &mut V)>
+    /// Returns the node at the given key or the key's upper bound if it doesn't exist
+    pub fn get_or_upper_bound(&self, key: &K) -> Option<(&K, &V)>
     where
         K: Ord,
     {
-        self.lower_bound_raw(key, return_equal).map(|node| unsafe {
-            (&(*node.as_ptr()).key, &mut (*node.as_ptr()).value)
-        })
+        self.neighborhood_search_raw(
+            key,
+            NeighborType::Successor,
+            Some(NeighborhoodSearchType::ReturnSearchKey),
+        )
+        .map(|node| unsafe { (&(*node.as_ptr()).key, &(*node.as_ptr()).value) })
+    }
+
+    /// Returns the node at the given key or the key's upper bound if it doesn't exist
+    pub fn get_or_upper_bound_mut(&self, key: &K) -> Option<(&K, &mut V)>
+    where
+        K: Ord,
+    {
+        self.neighborhood_search_raw(
+            key,
+            NeighborType::Successor,
+            Some(NeighborhoodSearchType::ReturnSearchKey),
+        )
+        .map(|node| unsafe { (&(*node.as_ptr()).key, &mut (*node.as_ptr()).value) })
     }
 
     /// Returns the predecessor of a node at the given key
@@ -432,11 +478,12 @@ impl<K, V> RBTree<K, V> {
     where
         K: Ord,
     {
-        self.find(key).and_then(|found| {
-            // SAFETY: `found` is a non-null node so it is valid by the type invariants.
-            let found_key = unsafe { &((*found.as_ptr()).key) };
-            self.lower_bound(found_key, false)
-        })
+        self.neighborhood_search_raw(
+            key,
+            NeighborType::Predecessor,
+            Some(NeighborhoodSearchType::SearchKeyMustExist),
+        )
+        .map(|node| unsafe { (&(*node.as_ptr()).key, &(*node.as_ptr()).value) })
     }
 
     /// Returns the predecessor of a node at the given key
@@ -446,11 +493,12 @@ impl<K, V> RBTree<K, V> {
     where
         K: Ord,
     {
-        self.find(key).and_then(|found| {
-            // SAFETY: `found` is a non-null node so it is valid by the type invariants.
-            let found_key = unsafe { &((*found.as_ptr()).key) };
-            self.lower_bound_mut(found_key, false)
-        })
+        self.neighborhood_search_raw(
+            key,
+            NeighborType::Predecessor,
+            Some(NeighborhoodSearchType::SearchKeyMustExist),
+        )
+        .map(|node| unsafe { (&(*node.as_ptr()).key, &mut (*node.as_ptr()).value) })
     }
 
     /// Returns the successor of a node at the given key
@@ -460,11 +508,12 @@ impl<K, V> RBTree<K, V> {
     where
         K: Ord,
     {
-        self.find(key).and_then(|found| {
-            // SAFETY: `found` is a non-null node so it is valid by the type invariants.
-            let found_key = unsafe { &((*found.as_ptr()).key) };
-            self.upper_bound(found_key, false)
-        })
+        self.neighborhood_search_raw(
+            key,
+            NeighborType::Successor,
+            Some(NeighborhoodSearchType::SearchKeyMustExist),
+        )
+        .map(|node| unsafe { (&(*node.as_ptr()).key, &(*node.as_ptr()).value) })
     }
 
     /// Returns the successor of a node at the given key
@@ -474,11 +523,12 @@ impl<K, V> RBTree<K, V> {
     where
         K: Ord,
     {
-        self.find(key).and_then(|found| {
-            // SAFETY: `found` is a non-null node so it is valid by the type invariants.
-            let found_key = unsafe { &((*found.as_ptr()).key) };
-            self.upper_bound_mut(found_key, false)
-        })
+        self.neighborhood_search_raw(
+            key,
+            NeighborType::Successor,
+            Some(NeighborhoodSearchType::SearchKeyMustExist),
+        )
+        .map(|node| unsafe { (&(*node.as_ptr()).key, &mut (*node.as_ptr()).value) })
     }
 
     /// Returns a reference to the value corresponding to the key.
@@ -734,6 +784,17 @@ impl<K, V> RBTreeNode<K, V> {
     }
 }
 
+enum NeighborType {
+    Predecessor,
+    Successor,
+}
+
+#[derive(PartialEq)]
+enum NeighborhoodSearchType {
+    SearchKeyMustExist,
+    ReturnSearchKey,
+}
+
 #[kunit_tests(rbtree)]
 mod tests {
     use crate::rbtree::RBTree;
@@ -741,49 +802,49 @@ mod tests {
     #[test]
     fn upper_bound() {
         let tree = get_test_tree();
-        assert_eq!(tree.upper_bound(&45, false), Some((&50, &50)));
+        assert_eq!(tree.upper_bound(&45), Some((&50, &50)));
     }
 
     #[test]
     fn upper_bound_of_exact_match() {
         let tree = get_test_tree();
-        assert_eq!(tree.upper_bound(&50, false), Some((&60, &60)));
+        assert_eq!(tree.upper_bound(&50), Some((&60, &60)));
     }
 
     #[test]
     fn upper_bound_of_less_than_head_is_head() {
         let tree = get_test_tree();
-        assert_eq!(tree.upper_bound(&5, false), Some((&10, &10)));
+        assert_eq!(tree.upper_bound(&5), Some((&10, &10)));
     }
 
     #[test]
     fn upper_bound_of_greater_than_tail_is_none() {
         let tree = get_test_tree();
-        assert_eq!(tree.upper_bound(&110, false), None);
+        assert_eq!(tree.upper_bound(&110), None);
     }
 
     #[test]
     fn lower_bound() {
         let tree = get_test_tree();
-        assert_eq!(tree.lower_bound(&55, false), Some((&50, &50)));
+        assert_eq!(tree.lower_bound(&55), Some((&50, &50)));
     }
 
     #[test]
     fn lower_bound_of_exact_match() {
         let tree = get_test_tree();
-        assert_eq!(tree.lower_bound(&50, false), Some((&40, &40)));
+        assert_eq!(tree.lower_bound(&50), Some((&40, &40)));
     }
 
     #[test]
     fn lower_bound_of_less_than_head_is_none() {
         let tree = get_test_tree();
-        assert_eq!(tree.lower_bound(&5, false), None);
+        assert_eq!(tree.lower_bound(&5), None);
     }
 
     #[test]
     fn lower_bound_of_greater_than_tail_is_tail() {
         let tree = get_test_tree();
-        assert_eq!(tree.lower_bound(&110, false), Some((&100, &100)));
+        assert_eq!(tree.lower_bound(&110), Some((&100, &100)));
     }
 
     #[test]

@@ -1,14 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0
 
-use kernel::{
-    macros::kunit_tests,
-    prelude::*,
-    rbtree::RBTree,
-};
+use kernel::{macros::kunit_tests, prelude::*, rbtree::RBTree};
 
 pub(crate) struct RangeAllocator<T> {
     tree: RBTree<usize, Descriptor<T>>,
-    free_tree: RBTree<(usize, usize), usize>
+    free_tree: RBTree<(usize, usize), usize>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -29,10 +25,8 @@ impl<T> RangeAllocator<T> {
     }
 
     fn find_best_match(&mut self, size: usize) -> Option<&mut Descriptor<T>> {
-        let best_match_key = self.free_tree.upper_bound(&(size, 0), true);
-        best_match_key.and_then(|(_, offset)| {
-            self.tree.get_mut(offset)
-        })
+        let best_match_key = self.free_tree.upper_bound(&(size, 0));
+        best_match_key.and_then(|(_, offset)| self.tree.get_mut(offset))
     }
 
     pub(crate) fn reserve_new(&mut self, size: usize) -> Result<usize> {
@@ -47,16 +41,17 @@ impl<T> RangeAllocator<T> {
                 } else {
                     (found.offset, None)
                 }
-            },
+            }
         };
-        
-        let success: Result<()> = match new { 
+
+        let success: Result<()> = match new {
             Some(new) => {
-                self.free_tree.try_insert((new.size, new.offset), new.offset)?;
+                self.free_tree
+                    .try_insert((new.size, new.offset), new.offset)?;
                 self.tree.try_insert(new.offset, new)?;
                 Ok(())
-            },
-            None => Ok(())
+            }
+            None => Ok(()),
         };
 
         // we mutated the found descriptor above, if something fails we need to put it back...right?
@@ -65,7 +60,7 @@ impl<T> RangeAllocator<T> {
                 mutated.state = DescriptorState::Free;
             }
             // TODO: what error?
-            return Err(EAGAIN)
+            return Err(EAGAIN);
         }
 
         self.free_tree.remove(&(size, offset));

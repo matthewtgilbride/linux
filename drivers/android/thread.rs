@@ -469,6 +469,7 @@ impl Thread {
         Ok(thread.into())
     }
 
+    #[inline(never)]
     pub(crate) fn debug_print(&self, m: &mut crate::debug::SeqFile) {
         let looper_flags;
         let looper_need_return;

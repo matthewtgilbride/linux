@@ -78,6 +78,40 @@ impl Node {
         }
     }
 
+    pub(crate) fn set_used_for_transaction(&self) {
+        let mut guard = self.owner.inner.lock();
+        let inner = self.inner.access_mut(&mut guard);
+        let has_strong = inner.strong.has_count;
+        drop(inner);
+        if !has_strong {
+            pr_err!("Failure: Sending transaction to {} but strong.has_count is false", self.global_id);
+        }
+    }
+
+    #[inline(never)]
+    pub(crate) fn debug_print(&self, m: &mut crate::debug::SeqFile) -> Result<()> {
+        let weak;
+        let strong;
+        let has_weak;
+        let has_strong;
+        let active_inc_refs;
+        {
+            let mut guard = self.owner.inner.lock();
+            let inner = self.inner.access_mut(&mut guard);
+            weak = inner.weak.count;
+            has_weak = inner.weak.has_count;
+            strong = inner.strong.count;
+            has_strong = inner.strong.has_count;
+            active_inc_refs = inner.active_inc_refs;
+        }
+
+        let has_weak = if has_weak { "Y" } else { "N" };
+        let has_strong = if has_strong { "Y" } else { "N" };
+
+        seq_print!(m, "node {},{:#x},{}: strong{}{} weak{}{} active{}\n", self.global_id, self.ptr, self.cookie, strong, has_strong, weak, has_weak, active_inc_refs);
+        Ok(())
+    }
+
     pub(crate) fn get_id(&self) -> (usize, usize) {
         (self.ptr, self.cookie)
     }

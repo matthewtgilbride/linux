@@ -375,6 +375,7 @@ impl Process {
         Ok(process)
     }
 
+    #[inline(never)]
     pub(crate) fn debug_print(&self, m: &mut crate::debug::SeqFile) -> Result<()> {
         seq_print!(m, "pid: {}\n", self.task.pid_in_current_ns());
 
@@ -383,6 +384,7 @@ impl Process {
         let has_proc_work;
         let mut ready_threads = Vec::new();
         let mut all_threads = Vec::new();
+        let mut all_nodes = Vec::new();
         loop {
             let inner = self.inner.lock();
             let ready_threads_len = {
@@ -395,13 +397,16 @@ impl Process {
                 ready_threads_len
             };
             let all_threads_len = inner.threads.values().count();
+            let all_nodes_len = inner.nodes.values().count();
             
             let resize_ready_threads = ready_threads_len > ready_threads.capacity();
             let resize_all_threads = all_threads_len > all_threads.capacity();
-            if resize_ready_threads || resize_all_threads {
+            let resize_all_nodes = all_nodes_len > all_nodes.capacity();
+            if resize_ready_threads || resize_all_threads || resize_all_nodes {
                 drop(inner);
                 ready_threads.try_reserve(ready_threads_len)?;
                 all_threads.try_reserve(all_threads_len)?;
+                all_nodes.try_reserve(all_nodes_len)?;
                 continue;
             }
 
@@ -423,6 +428,11 @@ impl Process {
                 all_threads.try_push(thread.clone())?;
             }
 
+            for node in inner.nodes.values() {
+                assert!(all_nodes.len() < all_nodes.capacity());
+                all_nodes.try_push(node.clone())?;
+            }
+
             break;
         }
 
@@ -437,6 +447,9 @@ impl Process {
                 seq_print!(m, " {}", thread_id);
             }
             seq_print!(m, "\n");
+        }
+        for node in all_nodes {
+            node.debug_print(m)?;
         }
 
         seq_print!(m, "all threads:\n");
@@ -623,11 +636,17 @@ impl Process {
 
     pub(crate) fn get_transaction_node(&self, handle: u32) -> BinderResult<NodeRef> {
         // When handle is zero, try to get the context manager.
-        if handle == 0 {
+        let node = if handle == 0 {
             self.ctx.get_manager_node(true)
         } else {
             self.get_node_from_handle(handle, true)
+        };
+
+        if let Ok(node_ref) = &node {
+            node_ref.node.set_used_for_transaction();
         }
+
+        node
     }
 
     pub(crate) fn get_node_from_handle(&self, handle: u32, strong: bool) -> BinderResult<NodeRef> {

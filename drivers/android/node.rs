@@ -222,28 +222,69 @@ impl Node {
 
     pub(crate) fn pending_oneway_finished(&self) {
         let mut guard = self.owner.inner.lock();
-        let transaction = {
-            let inner = self.inner.access_mut(&mut guard);
+        if !guard.is_dead() {
+            let transaction = {
+                let inner = self.inner.access_mut(&mut guard);
 
-            match inner.oneway_todo.pop_front() {
-                Some(transaction) => transaction,
-                None => {
-                    inner.has_pending_oneway_todo = false;
+                match inner.oneway_todo.pop_front() {
+                    Some(transaction) => transaction,
+                    None => {
+                        inner.has_pending_oneway_todo = false;
+                        return;
+                    }
+                }
+            };
+
+            let push_res = guard.push_work(transaction);
+            let inner = self.inner.access_mut(&mut guard);
+            match push_res {
+                Ok(()) => {
+                    inner.has_pending_oneway_todo = true;
                     return;
-                }
+                },
+                Err(_err) => {
+                    // This only fails if the process is dead.
+                    // We fall through to cleanup below.
+                },
             }
-        };
-        let push_res = guard.push_work(transaction);
-        let inner = self.inner.access_mut(&mut guard);
-        match push_res {
-            Ok(()) => inner.has_pending_oneway_todo = true,
-            Err(_err) => {
-                // This only fails if the process is dead.
-                while let Some(work) = inner.oneway_todo.pop_front() {
-                    work.cancel();
-                }
-                inner.has_pending_oneway_todo = false;
-            },
+        }
+
+        // Process is dead. Just clean up everything.
+        loop {
+            let inner = self.inner.access_mut(&mut guard);
+            let mut oneway_todo = core::mem::take(&mut inner.oneway_todo);
+            inner.has_pending_oneway_todo = false;
+            drop(guard);
+
+            if oneway_todo.is_empty() {
+                break;
+            }
+
+            while let Some(work) = oneway_todo.pop_front() {
+                work.cancel();
+            }
+
+            guard = self.owner.inner.lock();
+        }
+    }
+
+    pub(crate) fn cleanup_oneway(&self) {
+        let mut guard = self.owner.inner.lock();
+        loop {
+            let inner = self.inner.access_mut(&mut guard);
+            let mut oneway_todo = core::mem::take(&mut inner.oneway_todo);
+            inner.has_pending_oneway_todo = false;
+            drop(guard);
+
+            if oneway_todo.is_empty() {
+                break;
+            }
+
+            while let Some(work) = oneway_todo.pop_front() {
+                work.cancel();
+            }
+
+            guard = self.owner.inner.lock();
         }
     }
 }

@@ -173,6 +173,10 @@ impl ProcessInner {
         }
     }
 
+    pub(crate) fn is_dead(&self) -> bool {
+        self.is_dead
+    }
+
     // TODO: Should this be private?
     pub(crate) fn remove_node(&mut self, ptr: usize) {
         self.nodes.remove(&ptr);
@@ -1027,6 +1031,11 @@ impl Process {
         let threads = take(&mut inner.threads);
         let nodes = take(&mut inner.nodes);
         drop(inner);
+
+        // Cleanup queued oneway transactions.
+        for node in nodes.values() {
+            node.cleanup_oneway();
+        }
 
         // Release all threads.
         for thread in threads.values() {

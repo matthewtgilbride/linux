@@ -147,6 +147,10 @@ impl<'a> Allocation<'a> {
     pub(crate) fn set_info_clear_on_drop(&mut self) {
         self.get_or_init_info().clear_on_free = true;
     }
+
+    pub(crate) fn set_info_target_node(&mut self, target_node: NodeRef) {
+        self.get_or_init_info().target_node = Some(target_node);
+    }
 }
 
 impl Drop for Allocation<'_> {
@@ -155,10 +159,12 @@ impl Drop for Allocation<'_> {
             return;
         }
 
-        if let Some(info) = self.allocation_info.take() {
+        if let Some(mut info) = self.allocation_info.take() {
             if let Some(oneway_node) = info.oneway_node.as_ref() {
                 oneway_node.pending_oneway_finished();
             }
+
+            info.target_node = None;
 
             if let Some(offsets) = info.offsets.clone() {
                 let view = AllocationView::new(self, offsets.start);

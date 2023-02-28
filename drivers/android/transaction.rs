@@ -16,7 +16,7 @@ use kernel::{
 
 use crate::{
     defs::*,
-    node::NodeRef,
+    node::{Node, NodeRef},
     process::Process,
     ptr_align,
     thread::{BinderResult, BinderError, Thread},
@@ -29,8 +29,7 @@ struct TransactionInner {
 
 pub(crate) struct Transaction {
     inner: SpinLock<TransactionInner>,
-    // TODO: Node should be released when the buffer is released.
-    node_ref: Option<NodeRef>,
+    target_node: Option<Ref<Node>>,
     stack_next: Option<Ref<Transaction>>,
     pub(crate) from: Ref<Thread>,
     to: Ref<Process>,
@@ -75,6 +74,8 @@ impl Transaction {
         if trd.flags & TF_CLEAR_BUF != 0 {
             alloc.set_info_clear_on_drop();
         }
+        let target_node = node_ref.node.clone();
+        alloc.set_info_target_node(node_ref);
         let data_address = alloc.ptr;
         let file_list = alloc.take_file_list();
         alloc.keep_alive();
@@ -83,7 +84,7 @@ impl Transaction {
             inner: unsafe { SpinLock::new(TransactionInner { file_list }) },
             // SAFETY: `PINode::init` is called below.
             pi_node: unsafe { crate::pi::PINode::new(&from.task) },
-            node_ref: Some(node_ref),
+            target_node: Some(target_node),
             stack_next,
             from: from.clone(),
             to,
@@ -134,7 +135,7 @@ impl Transaction {
             inner: unsafe { SpinLock::new(TransactionInner { file_list }) },
             // SAFETY: `PINode::init` is called below.
             pi_node: unsafe { crate::pi::PINode::new(&from.task) },
-            node_ref: None,
+            target_node: None,
             stack_next: None,
             from: from.clone(),
             to,
@@ -179,11 +180,9 @@ impl Transaction {
     /// useful when finding a target for a new transaction: if the node belongs to a process that
     /// is already part of the transaction stack, we reuse the thread.
     fn find_target_thread(&self) -> Option<Ref<Thread>> {
-        let process = &self.node_ref.as_ref()?.node.owner;
-
         let mut it = &self.stack_next;
         while let Some(transaction) = it {
-            if Ref::ptr_eq(&transaction.from.process, process) {
+            if Ref::ptr_eq(&transaction.from.process, &self.to) {
                 return Some(transaction.from.clone());
             }
             it = &transaction.stack_next;
@@ -206,10 +205,12 @@ impl Transaction {
 
     /// Submits the transaction to a work queue. Use a thread if there is one in the transaction
     /// stack, otherwise use the destination process.
+    ///
+    /// Not used for replies.
     pub(crate) fn submit(self: Ref<Self>) -> BinderResult {
         if self.flags & TF_ONE_WAY != 0 {
-            if let Some(node_ref) = self.node_ref.as_ref() {
-                node_ref.node.clone().submit_oneway(self)?;
+            if let Some(target_node) = self.target_node.clone() {
+                target_node.submit_oneway(self)?;
                 return Ok(());
             } else {
                 pr_err!("Failed to submit oneway transaction to node.");
@@ -266,8 +267,7 @@ impl Transaction {
     /// If the target has no available threads, then this is done inside `do_work` when a thread
     /// picks it up instead.
     pub(crate) fn set_pi_owner(&self, owner: &Task) {
-        if self.node_ref.is_some() && self.flags & TF_ONE_WAY == 0 {
-            // Not a reply and not one-way.
+        if self.flags & TF_ONE_WAY == 0 {
             self.pi_node.set_owner(owner);
         }
     }
@@ -283,13 +283,13 @@ impl Transaction {
 impl DeliverToRead for Transaction {
     fn do_work(self: Ref<Self>, thread: &Thread, writer: &mut UserSlicePtrWriter) -> Result<bool> {
         let send_failed_reply = ScopeGuard::new(|| {
-            if self.node_ref.is_some() && self.flags & TF_ONE_WAY == 0 {
+            if self.target_node.is_some() && self.flags & TF_ONE_WAY == 0 {
                 let reply = Either::Right(BR_FAILED_REPLY);
                 self.from.deliver_reply(reply, &self);
             }
         });
 
-        if self.node_ref.is_some() && self.flags & TF_ONE_WAY == 0 {
+        if self.target_node.is_some() && self.flags & TF_ONE_WAY == 0 {
             // Not a reply and not one-way.
             self.pi_node.set_owner(&Task::current());
         }
@@ -305,8 +305,8 @@ impl DeliverToRead for Transaction {
         let mut tr_sec = BinderTransactionDataSecctx::default();
         let tr = tr_sec.tr_data();
 
-        if let Some(nref) = &self.node_ref {
-            let (ptr, cookie) = nref.node.get_id();
+        if let Some(target_node) = &self.target_node {
+            let (ptr, cookie) = target_node.get_id();
             tr.target.ptr = ptr as _;
             tr.cookie = cookie as _;
         };
@@ -323,7 +323,7 @@ impl DeliverToRead for Transaction {
         tr.sender_euid = self.sender_euid.into_uid_in_current_ns();
 
         tr.sender_pid = 0;
-        if self.node_ref.is_some() && self.flags & TF_ONE_WAY == 0 {
+        if self.target_node.is_some() && self.flags & TF_ONE_WAY == 0 {
             // Not a reply and not one-way.
             let from_proc = &*self.from.process;
             if !from_proc.is_dead() {
@@ -332,7 +332,7 @@ impl DeliverToRead for Transaction {
             }
         }
 
-        let code = if self.node_ref.is_none() {
+        let code = if self.target_node.is_none() {
             BR_REPLY
         } else {
             if self.txn_security_ctx_off.is_some() {
@@ -378,7 +378,7 @@ impl DeliverToRead for Transaction {
 
         // When this is not a reply and not an async transaction, update `current_transaction`. If
         // it's a reply, `current_transaction` has already been updated appropriately.
-        if self.node_ref.is_some() && tr_sec.transaction_data.flags & TF_ONE_WAY == 0 {
+        if self.target_node.is_some() && tr_sec.transaction_data.flags & TF_ONE_WAY == 0 {
             thread.set_current_transaction(self);
         }
 
@@ -387,7 +387,7 @@ impl DeliverToRead for Transaction {
 
     fn cancel(self: Ref<Self>) {
         // If this is not a reply or oneway transaction, then send a dead reply.
-        if self.node_ref.is_some() && self.flags & TF_ONE_WAY == 0 {
+        if self.target_node.is_some() && self.flags & TF_ONE_WAY == 0 {
             let reply = Either::Right(BR_DEAD_REPLY);
             self.from.deliver_reply(reply, &self);
         }

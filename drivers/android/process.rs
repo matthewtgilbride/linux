@@ -36,6 +36,9 @@ use crate::{
 pub(crate) struct AllocationInfo {
     /// Range within the allocation where we can find the offsets to the object descriptors.
     pub(crate) offsets: Option<Range<usize>>,
+    /// The target node of the transaction this allocation is associated to.
+    /// Not set for replies.
+    pub(crate) target_node: Option<NodeRef>,
     /// When this allocation is dropped, call `pending_oneway_finished` on the node.
     ///
     /// This is used to serialize oneway transaction on the same node. Binder guarantees that

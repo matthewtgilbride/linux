@@ -156,6 +156,10 @@ impl Drop for Allocation<'_> {
         }
 
         if let Some(info) = self.allocation_info.take() {
+            if let Some(oneway_node) = info.oneway_node.as_ref() {
+                oneway_node.pending_oneway_finished();
+            }
+
             if let Some(offsets) = info.offsets.clone() {
                 let view = AllocationView::new(self, offsets.start);
                 for i in offsets.step_by(size_of::<usize>()) {
@@ -163,10 +167,6 @@ impl Drop for Allocation<'_> {
                         pr_warn!("Error cleaning up object at offset {}\n", i)
                     }
                 }
-            }
-
-            if let Some(oneway_node) = info.oneway_node.as_ref() {
-                oneway_node.pending_oneway_finished();
             }
 
             if info.clear_on_free {

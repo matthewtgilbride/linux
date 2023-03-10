@@ -736,7 +736,7 @@ impl<'a, K, V> RBTreeCursor<'a, K, V> {
     /// Move the cursor to the next node,
     /// returning None if it doesn't exist
     pub fn next(mut self) -> Option<Self> {
-        self.mv(Direction::Next)
+       self.mv(Direction::Next)
     }
 
     fn mv(&mut self, direction: Direction) -> Option<Self> {

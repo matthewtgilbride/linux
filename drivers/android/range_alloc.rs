@@ -3,6 +3,7 @@
 use core::ptr::NonNull;
 use kernel::{
     linked_list::{CursorMut, GetLinks, Links, List},
+    rbtree::{RBTree, RBTreeNode, RBTreeNodeReservation},
     macros::kunit_tests,
     prelude::*,
 };
@@ -12,7 +13,7 @@ pub(crate) struct RangeAllocator<T> {
     free_tree: RBTree<(usize, usize), ()>
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum DescriptorState {
     Free,
     Reserved,
@@ -29,10 +30,7 @@ impl<T> RangeAllocator<T> {
     }
 
     fn find_best_match(&mut self, size: usize) -> Option<&mut Descriptor<T>> {
-        let mut cursor = match self.free_tree.cursor_lower_bound(&(size, 0)) {
-            None => return None,
-            Some(cursor) => cursor
-        };
+        let mut cursor = self.free_tree.cursor_lower_bound(&(size, 0))?;
         let ((_, offset), _) = cursor.current();
         self.tree.get_mut(&offset) // TODO: fighting the borrow checker
     }
@@ -101,6 +99,8 @@ impl<T> RangeAllocator<T> {
         let mut offset = desc.offset;
 
         let free_tree_res = RBTree::try_reserve_node()?;
+
+        desc.state = DescriptorState::Free;
 
         match cursor.peek_next() {
             Some((_, next)) if next.state == DescriptorState::Free => {
@@ -191,143 +191,192 @@ impl<T> GetLinks for Descriptor<T> {
     }
 }
 
+/// An allocation for use by `reserve_new`.
+pub(crate) struct ReserveNewDescriptor<T> {
+    tree_node_res: RBTreeNodeReservation<usize, Descriptor<T>>,
+    free_tree_node_res: RBTreeNodeReservation<(usize, usize), ()>
+}
+
+impl<T> ReserveNewDescriptor<T> {
+    pub(crate) fn try_new() -> Result<Self> {
+        let tree_node = RBTree::try_reserve_node()?;
+        let free_tree_node = RBTree::try_reserve_node()?;
+        Ok(Self { tree_node_res: tree_node, free_tree_node_res: free_tree_node })
+    }
+
+    fn initialize(self, desc: Descriptor<T>) -> (RBTreeNode<usize, Descriptor<T>>, RBTreeNode<(usize, usize), ()>) {
+        let size = desc.size;
+        let offset = desc.offset;
+        (
+            self.tree_node_res.into_node(offset, desc),
+            self.free_tree_node_res.into_node((size, offset), ())
+        )
+    }
+}
+
 #[kunit_tests(rust_android_binder_driver_range_alloc)]
 mod tests {
+    use core::iter::Iterator;
+
     use crate::range_alloc::RangeAllocator;
+    use crate::range_alloc::ReserveNewDescriptor;
     use crate::range_alloc::Descriptor;
     use crate::range_alloc::DescriptorState;
-    use kernel::linked_list::Cursor;
+    use kernel::rbtree::{RBTree, RBTreeCursor};
     use kernel::prelude::*;
     #[test]
     fn test_reserve_new() {
         let mut ra: RangeAllocator<usize> = RangeAllocator::new(10).unwrap();
-        let mut expected = [Some(DescriptorState::Free), None, None, None];
-        assert!(check_invariant_and_state(ra.list.cursor_front(), expected).is_none());
-        let offset = ra.reserve_new(4).unwrap();
-        expected = [Some(DescriptorState::Reserved), Some(DescriptorState::Free), None, None];
+        let mut expected: &[DescriptorState] = &[DescriptorState::Free];
+        assert_invariant_and_state(ra.tree.cursor_front().unwrap(), &ra.free_tree, expected);
+
+        let offset = ra.reserve_new(4, ReserveNewDescriptor::try_new().unwrap()).unwrap();
+        expected = &[DescriptorState::Reserved, DescriptorState::Free];
         assert_eq!(offset, 0);
-        assert!(check_invariant_and_state(ra.list.cursor_front(), expected).is_none());
-        let offset = ra.reserve_new(5).unwrap();
-        expected = [Some(DescriptorState::Reserved), Some(DescriptorState::Reserved), Some(DescriptorState::Free), None];
+        assert_invariant_and_state(ra.tree.cursor_front().unwrap(), &ra.free_tree, expected);
+
+        let offset = ra.reserve_new(5, ReserveNewDescriptor::try_new().unwrap()).unwrap();
+        expected = &[DescriptorState::Reserved, DescriptorState::Reserved, DescriptorState::Free];
         assert_eq!(offset, 4);
-        assert!(check_invariant_and_state(ra.list.cursor_front(), expected).is_none());
-        let offset = ra.reserve_new(1).unwrap();
-        expected = [Some(DescriptorState::Reserved), Some(DescriptorState::Reserved), Some(DescriptorState::Reserved), None];
+        assert_invariant_and_state(ra.tree.cursor_front().unwrap(), &ra.free_tree, expected);
+
+        let offset = ra.reserve_new(1, ReserveNewDescriptor::try_new().unwrap()).unwrap();
+        expected = &[DescriptorState::Reserved, DescriptorState::Reserved, DescriptorState::Reserved];
         assert_eq!(offset, 9);
-        assert!(check_invariant_and_state(ra.list.cursor_front(), expected).is_none());
-        let offset = ra.reserve_new(2);
+        assert_invariant_and_state(ra.tree.cursor_front().unwrap(), &ra.free_tree, expected);
+
+        let offset = ra.reserve_new(2, ReserveNewDescriptor::try_new().unwrap());
         assert!(offset.is_err());
     }
 
     #[test]
     fn test_reservation_abort_no_merge() {
         let mut ra: RangeAllocator<usize> = RangeAllocator::new(10).unwrap();
-        let mut expected = [Some(DescriptorState::Reserved), Some(DescriptorState::Reserved), Some(DescriptorState::Reserved), Some(DescriptorState::Free)];
-        ra.reserve_new(2).unwrap();
-        let offset_middle = ra.reserve_new(2).unwrap();
-        ra.reserve_new(2).unwrap();
+        let mut expected: &[DescriptorState] = &[DescriptorState::Reserved, DescriptorState::Reserved, DescriptorState::Reserved, DescriptorState::Free];
+        ra.reserve_new(2, ReserveNewDescriptor::try_new().unwrap()).unwrap();
+        let offset_middle = ra.reserve_new(2, ReserveNewDescriptor::try_new().unwrap()).unwrap();
+        ra.reserve_new(2, ReserveNewDescriptor::try_new().unwrap()).unwrap();
 
-        assert!(check_invariant_and_state(ra.list.cursor_front(), expected).is_none());
+        assert_invariant_and_state(ra.tree.cursor_front().unwrap(), &ra.free_tree, expected);
 
         ra.reservation_abort(offset_middle).unwrap();
-        expected = [Some(DescriptorState::Reserved), Some(DescriptorState::Free), Some(DescriptorState::Reserved), Some(DescriptorState::Free)];
+        expected = &[DescriptorState::Reserved, DescriptorState::Free, DescriptorState::Reserved, DescriptorState::Free];
 
-        assert!(check_invariant_and_state(ra.list.cursor_front(), expected).is_none());
+        assert_invariant_and_state(ra.tree.cursor_front().unwrap(), &ra.free_tree, expected);
     }
 
     #[test]
     fn test_reservation_abort_merge_right() {
         let mut ra: RangeAllocator<usize> = RangeAllocator::new(10).unwrap();
-        let mut expected = [Some(DescriptorState::Reserved), Some(DescriptorState::Reserved), Some(DescriptorState::Reserved), Some(DescriptorState::Free)];
-        ra.reserve_new(2).unwrap();
-        ra.reserve_new(2).unwrap();
-        let offset_right = ra.reserve_new(2).unwrap();
+        let mut expected: &[DescriptorState] = &[DescriptorState::Reserved, DescriptorState::Reserved, DescriptorState::Reserved, DescriptorState::Free];
+        ra.reserve_new(2, ReserveNewDescriptor::try_new().unwrap()).unwrap();
+        ra.reserve_new(2, ReserveNewDescriptor::try_new().unwrap()).unwrap();
+        let offset_right = ra.reserve_new(2, ReserveNewDescriptor::try_new().unwrap()).unwrap();
 
-        assert!(check_invariant_and_state(ra.list.cursor_front(), expected).is_none());
+        assert_invariant_and_state(ra.tree.cursor_front().unwrap(), &ra.free_tree, expected);
 
         ra.reservation_abort(offset_right).unwrap();
-        expected = [Some(DescriptorState::Reserved), Some(DescriptorState::Reserved), Some(DescriptorState::Free), None];
+        expected = &[DescriptorState::Reserved, DescriptorState::Reserved, DescriptorState::Free];
 
-        assert!(check_invariant_and_state(ra.list.cursor_front(), expected).is_none());
+        assert_invariant_and_state(ra.tree.cursor_front().unwrap(), &ra.free_tree, expected);
     }
 
     #[test]
     fn test_reservation_abort_merge_left() {
         let mut ra: RangeAllocator<usize> = RangeAllocator::new(10).unwrap();
-        let mut expected = [Some(DescriptorState::Reserved), Some(DescriptorState::Reserved), Some(DescriptorState::Reserved), Some(DescriptorState::Free)];
-        let offset_left = ra.reserve_new(2).unwrap();
-        let offset_middle = ra.reserve_new(2).unwrap();
-        ra.reserve_new(2).unwrap();
+        let mut expected: &[DescriptorState] = &[DescriptorState::Reserved, DescriptorState::Reserved, DescriptorState::Reserved, DescriptorState::Free];
+        let offset_left = ra.reserve_new(2,  ReserveNewDescriptor::try_new().unwrap()).unwrap();
+        let offset_middle = ra.reserve_new(2, ReserveNewDescriptor::try_new().unwrap()).unwrap();
+        ra.reserve_new(2, ReserveNewDescriptor::try_new().unwrap()).unwrap();
 
-        assert!(check_invariant_and_state(ra.list.cursor_front(), expected).is_none());
+        assert_invariant_and_state(ra.tree.cursor_front().unwrap(), &ra.free_tree, expected);
 
         ra.reservation_abort(offset_left).unwrap();
-        expected = [Some(DescriptorState::Free), Some(DescriptorState::Reserved), Some(DescriptorState::Reserved), Some(DescriptorState::Free)];
+        expected = &[DescriptorState::Free, DescriptorState::Reserved, DescriptorState::Reserved, DescriptorState::Free];
 
-        assert!(check_invariant_and_state(ra.list.cursor_front(), expected).is_none());
+        assert_invariant_and_state(ra.tree.cursor_front().unwrap(), &ra.free_tree, expected);
 
         ra.reservation_abort(offset_middle).unwrap();
-        expected = [Some(DescriptorState::Free), Some(DescriptorState::Reserved), Some(DescriptorState::Free), None];
+        expected = &[DescriptorState::Free, DescriptorState::Reserved, DescriptorState::Free];
 
-        assert!(check_invariant_and_state(ra.list.cursor_front(), expected).is_none());
+        assert_invariant_and_state(ra.tree.cursor_front().unwrap(), &ra.free_tree, expected);
     }
 
     #[test]
     fn test_reservation_abort_merge_both() {
         let mut ra: RangeAllocator<usize> = RangeAllocator::new(10).unwrap();
-        let mut expected = [Some(DescriptorState::Reserved), Some(DescriptorState::Reserved), Some(DescriptorState::Reserved), Some(DescriptorState::Free)];
-        let offset_left = ra.reserve_new(2).unwrap();
-        let offset_middle = ra.reserve_new(2).unwrap();
-        let offset_right = ra.reserve_new(2).unwrap();
+        let mut expected: &[DescriptorState] = &[DescriptorState::Reserved, DescriptorState::Reserved, DescriptorState::Reserved, DescriptorState::Free];
+        let offset_left = ra.reserve_new(2, ReserveNewDescriptor::try_new().unwrap()).unwrap();
+        let offset_middle = ra.reserve_new(2, ReserveNewDescriptor::try_new().unwrap()).unwrap();
+        let offset_right = ra.reserve_new(2, ReserveNewDescriptor::try_new().unwrap()).unwrap();
 
-        assert!(check_invariant_and_state(ra.list.cursor_front(), expected).is_none());
+        assert_invariant_and_state(ra.tree.cursor_front().unwrap(), &ra.free_tree, expected);
 
         ra.reservation_abort(offset_left).unwrap();
         ra.reservation_abort(offset_right).unwrap();
-        expected = [Some(DescriptorState::Free), Some(DescriptorState::Reserved), Some(DescriptorState::Free), None];
+        expected = &[DescriptorState::Free, DescriptorState::Reserved, DescriptorState::Free];
 
-        assert!(check_invariant_and_state(ra.list.cursor_front(), expected).is_none());
+        assert_invariant_and_state(ra.tree.cursor_front().unwrap(), &ra.free_tree, expected);
 
         ra.reservation_abort(offset_middle).unwrap();
-        expected = [Some(DescriptorState::Free), None, None, None];
+        expected = &[DescriptorState::Free];
 
-        assert!(check_invariant_and_state(ra.list.cursor_front(), expected).is_none());
+        assert_invariant_and_state(ra.tree.cursor_front().unwrap(), &ra.free_tree, expected);
     }
 
-    fn check_invariant_and_state(cursor: Cursor<Box<Descriptor<usize>>>, expected: [Option<DescriptorState>; 4]) -> Option<&str> {
+    fn assert_invariant_and_state(cursor: RBTreeCursor<'_, usize, Descriptor<usize>>, free_tree: &RBTree<(usize, usize), ()>, expected: &[DescriptorState]) {
         let mut cursor = cursor;
-        let mut last = None;
-        let mut index = 0;
-        while let Some(desc) = cursor.current() {
-            if let Some((last_offset, last_size, last_state)) = last {
-                if desc.offset != last_offset + last_size {
-                    return Some("offset/size invariant violated!");
-                }
-                match (last_state, &desc.state) {
-                    (&DescriptorState::Free, &DescriptorState::Free) => {
-                        return Some("adjacent free descriptors invariant violated!")
-                    },
-                    _ => {}
-                }
+        let mut index = 1;
+        let (_, mut desc) = cursor.current();
+
+        assert_eq!(expected[0], desc.state);
+
+        // free descriptors should always have corresponding entries in the free tree
+        if desc.state == DescriptorState::Free {
+            assert!(free_tree.get(&(desc.size, desc.offset)).is_some());
+        }
+
+        let mut last = (desc.offset, desc.size, desc.state);
+        let mut next = cursor.next();
+
+        while let Some(mut n) = next {
+            let (_, desc) = n.current();
+            let (last_offset, last_size, last_state) = last;
+
+            // adjacent free descriptors should always be merged together
+            assert!(match (last_state, desc.state) {
+                (DescriptorState::Free, DescriptorState::Free) => false,
+                _ => true
+            });
+
+            assert_eq!(expected[index], desc.state);
+
+            // any descriptor's offset should always be a function of it's predecessors offset + size
+            assert_eq!(desc.offset, last_offset + last_size);
+
+            // free descriptors should always have corresponding entries in the free tree
+            if desc.state == DescriptorState::Free {
+                assert!(free_tree.get(&(desc.size, desc.offset)).is_some());
             }
-            match expected[index] {
-                None => return Some("more descriptors than expected!"),
-                Some(ref expected_state) => {
-                    if expected_state != &desc.state {
-                        return Some("unexpected descriptor state!")
-                    }
-                }
-            }
-            last = Some((&desc.offset, &desc.size, &desc.state));
+
+
+            last = (desc.offset, desc.size, desc.state);
             index += 1;
-            cursor.move_next();
+            next = n.next();
         }
-        while index < 4 {
-            if expected[index].is_some() {
-                return Some("more expected than descriptors!")
-            }
-            index += 1
-        }
-        None
+
+        assert!(expected.len() == index);
+
+        // the free tree should not have extra entries
+        let mut expected_free_count = 0;
+        expected.iter()
+            .filter(|&e| e == &DescriptorState::Free)
+            .for_each(|_| { expected_free_count += 1; });
+
+        let mut actual_free_count = 0;
+        free_tree.iter()
+            .for_each(|_| { actual_free_count += 1; });
+
+        assert_eq!(expected_free_count, actual_free_count);
     }
 }

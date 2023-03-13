@@ -367,6 +367,48 @@ impl<K, V> RBTree<K, V> {
     }
 
     /// Returns a cursor over the tree nodes, starting with the smallest key
+    /// ```
+    /// use kernel::rbtree::RBTree;
+    ///
+    /// // Create a new tree.
+    /// let mut tree = RBTree::new();
+    ///
+    /// // Insert three elements.
+    /// tree.try_insert(10, 100)?;
+    /// tree.try_insert(20, 200)?;
+    /// tree.try_insert(30, 300)?;
+    ///
+    /// // get a cursor to the first element
+    /// let mut cursor = tree.cursor_front().unwrap();
+    /// let mut current = cursor.current();
+    /// assert_eq!(current, (&10, &mut 100));
+    /// // move the cursor, updating it to the 2nd element
+    /// cursor = cursor.next().unwrap();
+    /// current = cursor.current();
+    /// assert_eq!(current, (&20, &mut 200));
+    /// // peek at the next element without impacting the cursor
+    /// let next = cursor.peek_next().unwrap();
+    /// assert_eq!(next, (&30, &mut 300));
+    /// current = cursor.current();
+    /// assert_eq!(current, (&20, &mut 200));
+    /// // moving past the last element causes the cursor to return none
+    /// cursor = cursor.next().unwrap();
+    /// current = cursor.current();
+    /// assert_eq!(current, (&30, &mut 300));
+    /// let cursor = cursor.next();
+    /// assert!(cursor.is_none());
+    ///
+    /// # Ok::<(), Error>(())
+    /// ```
+    /// Returns None if the tree is empty
+    /// ```
+    /// use kernel::rbtree::RBTree;
+    ///
+    /// // Create a new tree.
+    /// let mut tree: RBTree<u16, u16> = RBTree::new();
+    /// assert!(tree.cursor_front().is_none());
+    /// # Ok::<(), Error>(())
+    /// ```
     pub fn cursor_front(&mut self) -> Option<RBTreeCursor<'_, K, V>> {
         let root = addr_of_mut!(self.root);
         // SAFETY: `self.root` is always a valid root node
@@ -382,6 +424,22 @@ impl<K, V> RBTree<K, V> {
     }
 
     /// Returns a cursor over the tree nodes, starting with the largest key
+    /// ```
+    /// use kernel::rbtree::RBTree;
+    ///
+    /// // Create a new tree.
+    /// let mut tree = RBTree::new();
+    ///
+    /// // Insert three elements.
+    /// tree.try_insert(10, 100)?;
+    /// tree.try_insert(20, 200)?;
+    /// tree.try_insert(30, 300)?;
+    ///
+    /// let mut cursor = tree.cursor_back().unwrap();
+    /// let current = cursor.current();
+    /// assert_eq!(current, (&30, &mut 300));
+    ///
+    /// # Ok::<(), Error>(())
     pub fn cursor_back(&mut self) -> Option<RBTreeCursor<'_, K, V>> {
         let root = addr_of_mut!(self.root);
         // SAFETY: `self.root` is always a valid root node
@@ -398,8 +456,57 @@ impl<K, V> RBTree<K, V> {
 
     /// Returns a cursor over the tree nodes based on the given key.
     /// If the given key exists, the cursor starts there.
+    /// ```
+    /// use kernel::rbtree::RBTree;
+    ///
+    /// // Create a new tree.
+    /// let mut tree = RBTree::new();
+    ///
+    /// // Insert three elements.
+    /// tree.try_insert(10, 100)?;
+    /// tree.try_insert(20, 200)?;
+    /// tree.try_insert(30, 300)?;
+    ///
+    /// let mut cursor = tree.cursor_lower_bound(&20).unwrap();
+    /// let current = cursor.current();
+    /// assert_eq!(current, (&20, &mut 200));
+    /// # Ok::<(), Error>(())
+    /// ```
     /// Otherwise it starts with the first larger key in sort order.
+    /// ```
+    /// use kernel::rbtree::RBTree;
+    ///
+    /// // Create a new tree.
+    /// let mut tree = RBTree::new();
+    ///
+    /// // Insert five elements.
+    /// tree.try_insert(10, 100)?;
+    /// tree.try_insert(20, 200)?;
+    /// tree.try_insert(30, 300)?;
+    /// tree.try_insert(40, 400)?;
+    /// tree.try_insert(50, 500)?;
+    ///
+    /// let mut cursor = tree.cursor_lower_bound(&25).unwrap();
+    /// let current = cursor.current();
+    /// assert_eq!(current, (&30, &mut 300));
+    /// # Ok::<(), Error>(())
+    /// ```
     /// If there is no larger key, it returns None
+    /// ```
+    /// use kernel::rbtree::RBTree;
+    ///
+    /// // Create a new tree.
+    /// let mut tree = RBTree::new();
+    ///
+    /// // Insert three elements.
+    /// tree.try_insert(10, 100)?;
+    /// tree.try_insert(20, 200)?;
+    /// tree.try_insert(30, 300)?;
+    ///
+    /// let cursor = tree.cursor_lower_bound(&35);
+    /// assert!(cursor.is_none());
+    /// # Ok::<(), Error>(())
+    /// ```
     pub fn cursor_lower_bound(&mut self, key: &K) -> Option<RBTreeCursor<'_, K, V>>
     where
         K: Ord,
@@ -508,14 +615,95 @@ pub struct RBTreeCursor<'a, K, V> {
 
 impl<'a, K, V> RBTreeCursor<'a, K, V> {
     /// The current node, with a mutable value
+    /// ```
+    /// use kernel::rbtree::RBTree;
+    ///
+    /// // Create a new tree.
+    /// let mut tree = RBTree::new();
+    ///
+    /// // Insert three elements.
+    /// tree.try_insert(10, 100)?;
+    /// tree.try_insert(20, 200)?;
+    /// tree.try_insert(30, 300)?;
+    ///
+    /// // retrieve a cursor
+    /// let mut cursor = tree.cursor_front().unwrap();
+    /// // get a mutable reference to the current value
+    /// let (k, v) = cursor.current();
+    /// *v = 1000;
+    /// // the updated value is reflected in the tree
+    /// let updated = tree.get(&10).unwrap();
+    /// assert_eq!(updated, &1000);
+    ///
+    /// # Ok::<(), Error>(())
     pub fn current(&mut self) -> (&K, &mut V) {
         self.to_key_value_mut(self.current)
     }
 
     /// Removes the current node from the tree.
     /// Returns a cursor to the next node, if it exists.
+    /// ```
+    /// use kernel::rbtree::RBTree;
+    ///
+    /// // Create a new tree.
+    /// let mut tree = RBTree::new();
+    ///
+    /// // Insert three elements.
+    /// tree.try_insert(10, 100)?;
+    /// tree.try_insert(20, 200)?;
+    /// tree.try_insert(30, 300)?;
+    ///
+    /// // remove the first element
+    /// let mut cursor = tree.cursor_front().unwrap();
+    /// let mut current = cursor.current();
+    /// assert_eq!(current, (&10, &mut 100));
+    /// cursor = cursor.remove_current().unwrap();
+    /// current = cursor.current();
+    /// assert_eq!(current, (&20, &mut 200));
+    ///
+    /// # Ok::<(), Error>(())
+    /// ```
     /// Returns a cursor to the previous node if there is no next node
+    /// ```
+    /// use kernel::rbtree::RBTree;
+    ///
+    /// // Create a new tree.
+    /// let mut tree = RBTree::new();
+    ///
+    /// // Insert three elements.
+    /// tree.try_insert(10, 100)?;
+    /// tree.try_insert(20, 200)?;
+    /// tree.try_insert(30, 300)?;
+    ///
+    /// // remove the last element
+    /// let mut cursor = tree.cursor_back().unwrap();
+    /// let mut current = cursor.current();
+    /// assert_eq!(current, (&30, &mut 300));
+    /// cursor = cursor.remove_current().unwrap();
+    /// current = cursor.current();
+    /// assert_eq!(current, (&20, &mut 200));
+    ///
+    /// # Ok::<(), Error>(())
+    /// ```
     /// Returns None if the current node was the last one in the tree
+    /// ```
+    /// use kernel::rbtree::RBTree;
+    ///
+    /// // Create a new tree.
+    /// let mut tree = RBTree::new();
+    ///
+    /// // Insert one elements.
+    /// tree.try_insert(20, 200)?;
+    ///
+    /// // remove the only element
+    /// let mut cursor = tree.cursor_front().unwrap();
+    /// let current = cursor.current();
+    /// assert_eq!(current, (&20, &mut 200));
+    /// let cursor = cursor.remove_current();
+    /// assert!(cursor.is_none());
+    ///
+    /// # Ok::<(), Error>(())
+    /// ```
     pub fn remove_current(mut self) -> Option<Self> {
         let prev = self.get_neighbor_raw(Direction::Prev);
         let next = self.get_neighbor_raw(Direction::Next);

@@ -53,4 +53,9 @@ config ANDROID_BINDER_IPC_SELFTEST
 	  exhaustively with combinations of various buffer sizes and
 	  alignments.
 
+config ANDROID_BINDER_IPC_SELFTEST_RUST
+	tristate "Tests for rusty binder" if !KUNIT_ALL_TESTS
+	depends on ANDROID_BINDER_IPC_RUST && KUNIT=y
+	default KUNIT_ALL_TESTS
+
 endmenu

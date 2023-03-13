@@ -655,7 +655,7 @@ impl Process {
             None => {
                 drop(mapping);
                 drop(inner);
-                let alloc = crate::range_alloc::ReserveNewBox::try_new()?;
+                let alloc = crate::range_alloc::ReserveNewDescriptor::try_new()?;
                 inner = self.inner.lock();
                 mapping = inner.mapping.as_mut().ok_or_else(BinderError::new_dead)?;
                 mapping.alloc.reserve_new(size, alloc)?

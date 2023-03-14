@@ -2,7 +2,6 @@
 
 use core::ptr::NonNull;
 use kernel::{
-    linked_list::{CursorMut, GetLinks, Links, List},
     rbtree::{RBTree, RBTreeNode, RBTreeNodeReservation},
     macros::kunit_tests,
     prelude::*,
@@ -32,7 +31,7 @@ impl<T> RangeAllocator<T> {
     fn find_best_match(&mut self, size: usize) -> Option<&mut Descriptor<T>> {
         let mut cursor = self.free_tree.cursor_lower_bound(&(size, 0))?;
         let ((_, offset), _) = cursor.current();
-        self.tree.get_mut(&offset) // TODO: fighting the borrow checker
+        self.tree.get_mut(&offset)
     }
 
     /// Try to reserve a new buffer, using the provided allocation if necessary.
@@ -80,8 +79,8 @@ impl<T> RangeAllocator<T> {
         };
 
         found.state = DescriptorState::Reserved;
-        let size = found.size; // why do I have to have these let statements
-        let offset = found.offset; // to make you happy, borrow checker?
+        let size = found.size;
+        let offset = found.offset;
         self.free_tree.remove(&(size, offset));
         Ok(Some(offset))
     }
@@ -102,23 +101,36 @@ impl<T> RangeAllocator<T> {
 
         desc.state = DescriptorState::Free;
 
-        match cursor.peek_next() {
+        let remove_next = match cursor.peek_next() {
             Some((_, next)) if next.state == DescriptorState::Free => {
-                // update next to be merged with current, remove current
+                // Merge current with next
                 self.free_tree.remove(&(next.size, next.offset));
                 size += next.size;
-                next.size = size;
-                next.offset = offset;
-                // we already checked that a next node exists, remove_current
-                // will return it successfully
-                cursor = cursor.remove_current().unwrap();
+                true
             }
-            _ => {}, 
+            _ => false,
         };
+
+        let (_, desc) = cursor.current();
+        if remove_next {
+            desc.size = size;
+            // We already checked that a next node exists,
+            // so next() will return it successfully.
+            cursor = cursor.next().unwrap();
+            // We know there are at least 2 nodes,
+            // so we can remove one safely.
+            cursor = cursor.remove_current().unwrap();
+            let (key, _) = cursor.current();
+            if key > &offset {
+                // We walked to the right when removing.
+                // Go back to the original position.
+                cursor = cursor.prev().unwrap()
+            }
+        }
 
         match cursor.peek_prev() {
             Some((_, prev)) if prev.state == DescriptorState::Free => {
-                // update previous to be merged with current, remove current
+                // merge previous with current, remove current
                 self.free_tree.remove(&(prev.size, prev.offset));
                 offset = prev.offset;
                 size += prev.size;
@@ -168,7 +180,6 @@ struct Descriptor<T> {
     state: DescriptorState,
     size: usize,
     offset: usize,
-    links: Links<Descriptor<T>>,
     data: Option<T>,
 }
 
@@ -178,16 +189,8 @@ impl<T> Descriptor<T> {
             size,
             offset,
             state: DescriptorState::Free,
-            links: Links::new(),
             data: None,
         }
-    }
-}
-
-impl<T> GetLinks for Descriptor<T> {
-    type EntryType = Self;
-    fn get_links(desc: &Self) -> &Links<Self> {
-        &desc.links
     }
 }
 
@@ -199,9 +202,9 @@ pub(crate) struct ReserveNewDescriptor<T> {
 
 impl<T> ReserveNewDescriptor<T> {
     pub(crate) fn try_new() -> Result<Self> {
-        let tree_node = RBTree::try_reserve_node()?;
-        let free_tree_node = RBTree::try_reserve_node()?;
-        Ok(Self { tree_node_res: tree_node, free_tree_node_res: free_tree_node })
+        let tree_node_res = RBTree::try_reserve_node()?;
+        let free_tree_node_res = RBTree::try_reserve_node()?;
+        Ok(Self { tree_node_res, free_tree_node_res })
     }
 
     fn initialize(self, desc: Descriptor<T>) -> (RBTreeNode<usize, Descriptor<T>>, RBTreeNode<(usize, usize), ()>) {
@@ -385,17 +388,47 @@ mod tests {
 
         assert_invariant_and_state(ra.tree.cursor_front().unwrap(), &ra.free_tree, expected);
 
-        ra.reserve_existing(offset_middle).unwrap();
+        let existing = ra.reserve_existing(offset_middle).unwrap();
+        assert_eq!(existing, (2, Some(1)));
         expected = &[DescriptorState::Free, DescriptorState::Reserved, DescriptorState::Free];
 
+        assert_invariant_and_state(ra.tree.cursor_front().unwrap(), &ra.free_tree, expected);
+    }
+
+    #[test]
+    fn test_end_to_end() {
+        let mut ra: RangeAllocator<usize> = RangeAllocator::new(1040384).unwrap();
+        let mut expected: &[DescriptorState] = &[DescriptorState::Free];
+        assert_invariant_and_state(ra.tree.cursor_front().unwrap(), &ra.free_tree, expected);
+
+        assert!(ra.reserve_new_noalloc(16).unwrap().is_none());
+
+        let offset = ra.reserve_new(16, ReserveNewDescriptor::try_new().unwrap()).unwrap();
+        let mut expected: &[DescriptorState] = &[DescriptorState::Reserved, DescriptorState::Free];
+        assert_eq!(offset, 0);
+        assert_invariant_and_state(ra.tree.cursor_front().unwrap(), &ra.free_tree, expected);
+
+        ra.reservation_commit(0, Some(1)).unwrap();
+        expected = &[DescriptorState::Allocated, DescriptorState::Free];
+        assert_invariant_and_state(ra.tree.cursor_front().unwrap(), &ra.free_tree, expected);
+
+        let existing = ra.reserve_existing(offset).unwrap();
+        assert_eq!(existing, (16, Some(1)));
+
+        expected = &[DescriptorState::Reserved, DescriptorState::Free];
+        assert_invariant_and_state(ra.tree.cursor_front().unwrap(), &ra.free_tree, expected);
+
+        ra.reservation_abort(0).unwrap();
+        expected = &[DescriptorState::Free];
         assert_invariant_and_state(ra.tree.cursor_front().unwrap(), &ra.free_tree, expected);
     }
 
     fn assert_invariant_and_state(cursor: RBTreeCursor<'_, usize, Descriptor<usize>>, free_tree: &RBTree<(usize, usize), ()>, expected: &[DescriptorState]) {
         let mut cursor = cursor;
         let mut index = 1;
-        let (_, mut desc) = cursor.current();
+        let (key, mut desc) = cursor.current();
 
+        assert_eq!(key, &desc.offset);
         assert_eq!(expected[0], desc.state);
 
         // free descriptors should always have corresponding entries in the free tree
@@ -407,16 +440,17 @@ mod tests {
         let mut next = cursor.next();
 
         while let Some(mut n) = next {
-            let (_, desc) = n.current();
+            let (key, desc) = n.current();
             let (last_offset, last_size, last_state) = last;
+
+            assert_eq!(key, &desc.offset);
+            assert_eq!(expected[index], desc.state);
 
             // adjacent free descriptors should always be merged together
             assert!(match (last_state, desc.state) {
                 (DescriptorState::Free, DescriptorState::Free) => false,
                 _ => true
             });
-
-            assert_eq!(expected[index], desc.state);
 
             // any descriptor's offset should always be a function of it's predecessors offset + size
             assert_eq!(desc.offset, last_offset + last_size);

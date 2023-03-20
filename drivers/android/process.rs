@@ -43,7 +43,7 @@ struct Mapping {
 
 impl Mapping {
     fn new(address: usize, size: usize, pages: Arc<[Pages<0>]>) -> Result<Self> {
-        let alloc = RangeAllocator::new(size)?;
+        let alloc: RangeAllocator<AllocationInfo> = RangeAllocator::<AllocationInfo>::new(size)?;
         Ok(Self {
             address,
             alloc,
@@ -530,7 +530,8 @@ impl Process {
         let mut inner = self.inner.lock();
         let mapping = inner.mapping.as_mut().ok_or_else(BinderError::new_dead)?;
 
-        let offset = mapping.alloc.reserve_new(size)?;
+        let alloc = crate::range_alloc::ReserveNewBox::try_new()?;
+        let offset = mapping.alloc.reserve_new(size, alloc)?;
         Ok(Allocation::new(
             self,
             offset,

@@ -13,7 +13,7 @@ use core::{
     iter::{IntoIterator, Iterator},
     marker::PhantomData,
     mem::MaybeUninit,
-    ptr::{addr_of_mut, NonNull},
+    ptr::{addr_of_mut, read, NonNull},
 };
 
 struct Node<K, V> {
@@ -383,7 +383,7 @@ impl<K, V> RBTree<K, V> {
     /// let mut current = cursor.current();
     /// assert_eq!(current, (&10, &mut 100));
     /// // move the cursor, updating it to the 2nd element
-    /// cursor = cursor.next().unwrap();
+    /// cursor = cursor.move_next().unwrap();
     /// current = cursor.current();
     /// assert_eq!(current, (&20, &mut 200));
     /// // peek at the next element without impacting the cursor
@@ -392,10 +392,10 @@ impl<K, V> RBTree<K, V> {
     /// current = cursor.current();
     /// assert_eq!(current, (&20, &mut 200));
     /// // moving past the last element causes the cursor to return none
-    /// cursor = cursor.next().unwrap();
+    /// cursor = cursor.move_next().unwrap();
     /// current = cursor.current();
     /// assert_eq!(current, (&30, &mut 300));
-    /// let cursor = cursor.next();
+    /// let cursor = cursor.move_next();
     /// assert!(cursor.is_none());
     ///
     /// # Ok::<(), Error>(())
@@ -614,6 +614,11 @@ pub struct RBTreeCursor<'a, K, V> {
 }
 
 impl<'a, K, V> RBTreeCursor<'a, K, V> {
+    /// The current node
+    pub fn current(&self) -> (&K, &V) {
+        self.to_key_value(self.current)
+    }
+
     /// The current node, with a mutable value
     /// ```
     /// use kernel::rbtree::RBTree;
@@ -629,14 +634,14 @@ impl<'a, K, V> RBTreeCursor<'a, K, V> {
     /// // retrieve a cursor
     /// let mut cursor = tree.cursor_front().unwrap();
     /// // get a mutable reference to the current value
-    /// let (k, v) = cursor.current();
+    /// let (k, v) = cursor.current_mut();
     /// *v = 1000;
     /// // the updated value is reflected in the tree
     /// let updated = tree.get(&10).unwrap();
     /// assert_eq!(updated, &1000);
     ///
     /// # Ok::<(), Error>(())
-    pub fn current(&mut self) -> (&K, &mut V) {
+    pub fn current_mut(&mut self) -> (&K, &mut V) {
         self.to_key_value_mut(self.current)
     }
 
@@ -727,19 +732,92 @@ impl<'a, K, V> RBTreeCursor<'a, K, V> {
         })
     }
 
+    /// Remove the previous node - returning it if it exists
+    /// ```
+    /// use kernel::rbtree::RBTree;
+    ///
+    /// // Create a new tree.
+    /// let mut tree = RBTree::new();
+    ///
+    /// // Insert three elements.
+    /// tree.try_insert(10, 100)?;
+    /// tree.try_insert(20, 200)?;
+    /// tree.try_insert(30, 300)?;
+    ///
+    /// let mut cursor = tree.cursor_front().unwrap();
+    /// let mut current = cursor.current();
+    /// assert_eq!(current, (&10, &mut 100));
+    /// // remove_prev from the front returns None
+    /// assert!(cursor.remove_prev().is_none());
+    /// cursor = tree.cursor_back().unwrap();
+    /// current = cursor.current();
+    /// assert_eq!(current, (&30, &mut 300));
+    /// // remove_prev from the back returns the middle element
+    /// assert_eq!(cursor.remove_prev().unwrap(), (20, 200));
+    /// // and the previous element is now the original first
+    /// assert_eq!(cursor.peek_prev().unwrap(), (&10, &100));
+    ///
+    /// # Ok::<(), Error>(())
+    /// ```
+    pub fn remove_prev(&mut self) -> Option<(K, V)> {
+        self.remove_neighbor(Direction::Prev)
+    }
+
+    /// Remove the next node - returning it if it exists
+    /// ```
+    /// use kernel::rbtree::RBTree;
+    ///
+    /// // Create a new tree.
+    /// let mut tree = RBTree::new();
+    ///
+    /// // Insert three elements.
+    /// tree.try_insert(10, 100)?;
+    /// tree.try_insert(20, 200)?;
+    /// tree.try_insert(30, 300)?;
+    ///
+    /// let mut cursor = tree.cursor_back().unwrap();
+    /// let mut current = cursor.current();
+    /// assert_eq!(current, (&30, &mut 300));
+    /// // remove_next from the back returns None
+    /// assert!(cursor.remove_next().is_none());
+    /// cursor = tree.cursor_front().unwrap();
+    /// current = cursor.current();
+    /// assert_eq!(current, (&10, &mut 100));
+    /// // remove_next from the front returns the middle element
+    /// assert_eq!(cursor.remove_next().unwrap(), (20, 200));
+    /// // and the next element is now the original last
+    /// assert_eq!(cursor.peek_next().unwrap(), (&30, &300));
+    ///
+    /// # Ok::<(), Error>(())
+    /// ```
+    pub fn remove_next(&mut self) -> Option<(K, V)> {
+        self.remove_neighbor(Direction::Next)
+    }
+
+    fn remove_neighbor(&mut self, direction: Direction) -> Option<(K, V)> {
+        if let Some(neighbor) = self.get_neighbor_raw(direction) {
+            let this = crate::container_of!(neighbor, Node<K, V>, links) as *mut Node<K, V>;
+            // SAFETY: The reference to the tree used to create the cursor outlives the cursor, so
+            // the tree cannot change. By the tree invariant, all nodes are valid.
+            unsafe { bindings::rb_erase(&mut (*this).links, self.root) };
+            return Some(self.to_key_value_owned(neighbor));
+        }
+        None
+    }
+
     /// Move the cursor to the previous node,
     /// returning None if it doesn't exist
-    pub fn prev(mut self) -> Option<Self> {
+    pub fn move_prev(self) -> Option<Self> {
         self.mv(Direction::Prev)
     }
 
     /// Move the cursor to the next node,
     /// returning None if it doesn't exist
-    pub fn next(mut self) -> Option<Self> {
-       self.mv(Direction::Next)
+    pub fn move_next(self) -> Option<Self> {
+        self.mv(Direction::Next)
     }
 
-    fn mv(&mut self, direction: Direction) -> Option<Self> {
+    fn mv(mut self, direction: Direction) -> Option<Self> {
         self.get_neighbor_raw(direction).map(|neighbor| Self {
             _tree: self._tree,
             root: self.root,
@@ -748,16 +826,42 @@ impl<'a, K, V> RBTreeCursor<'a, K, V> {
     }
 
     /// Access the previous node without moving the cursor
-    pub fn peek_prev(&mut self) -> Option<(&K, &mut V)> {
+    pub fn peek_prev(&self) -> Option<(&K, &V)> {
         self.peek(Direction::Prev)
     }
 
-    /// Access the next node without moving the cursor
-    pub fn peek_next(&mut self) -> Option<(&K, &mut V)> {
+    /// Access the previous node without moving the cursor
+    pub fn peek_next(&self) -> Option<(&K, &V)> {
         self.peek(Direction::Next)
     }
 
-    fn peek(&mut self, direction: Direction) -> Option<(&K, &mut V)> {
+    fn peek(&self, direction: Direction) -> Option<(&K, &V)> {
+        // SAFETY: `self.current` is a non-null node so it is valid by the type invariants.
+        let neighbor = unsafe {
+            match direction {
+                Direction::Prev => bindings::rb_prev(self.current),
+                Direction::Next => bindings::rb_next(self.current),
+            }
+        };
+
+        if neighbor.is_null() {
+            return None;
+        }
+
+        Some(self.to_key_value(neighbor))
+    }
+
+    /// Access the previous node mutably without moving the cursor
+    pub fn peek_prev_mut(&mut self) -> Option<(&K, &mut V)> {
+        self.peek_mut(Direction::Prev)
+    }
+
+    /// Access the next node mutably without moving the cursor
+    pub fn peek_next_mut(&mut self) -> Option<(&K, &mut V)> {
+        self.peek_mut(Direction::Next)
+    }
+
+    fn peek_mut(&mut self, direction: Direction) -> Option<(&K, &mut V)> {
         // SAFETY: `self.current` is a non-null node so it is valid by the type invariants.
         let neighbor = unsafe {
             match direction {
@@ -790,12 +894,32 @@ impl<'a, K, V> RBTreeCursor<'a, K, V> {
     }
 
     // SAFETY: this internal method should ONLY be called with a valid pointer to a node
+    fn to_key_value(&self, node: *mut bindings::rb_node) -> (&'a K, &'a V) {
+        let this = crate::container_of!(node, Node<K, V>, links) as *mut Node<K, V>;
+        // SAFETY: `this` is a non-null node so it is valid by the type invariants.
+        let k = unsafe { &(*this).key };
+        // SAFETY: `this` is a non-null node so it is valid by the type invariants.
+        let v = unsafe { &(*this).value };
+        (k, v)
+    }
+
+    // SAFETY: this internal method should ONLY be called with a valid pointer to a node
     fn to_key_value_mut(&mut self, node: *mut bindings::rb_node) -> (&'a K, &'a mut V) {
         let this = crate::container_of!(node, Node<K, V>, links) as *mut Node<K, V>;
         // SAFETY: `this` is a non-null node so it is valid by the type invariants.
         let k = unsafe { &(*this).key };
         // SAFETY: `this` is a non-null node so it is valid by the type invariants.
         let v = unsafe { &mut (*this).value };
+        (k, v)
+    }
+
+    // SAFETY: this internal method should ONLY be called with a valid pointer to a node THAT IS BEING REMOVED
+    fn to_key_value_owned(&mut self, node: *mut bindings::rb_node) -> (K, V) {
+        let this = crate::container_of!(node, Node<K, V>, links) as *const Node<K, V>;
+        // SAFETY: `this` is a non-null node so it is valid by the type invariants.
+        let k = unsafe { read(this).key };
+        // SAFETY: `this` is a non-null node so it is valid by the type invariants.
+        let v = unsafe { read(this).value };
         (k, v)
     }
 }

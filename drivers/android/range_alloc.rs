@@ -29,8 +29,8 @@ impl<T> RangeAllocator<T> {
     }
 
     fn find_best_match(&mut self, size: usize) -> Option<&mut Descriptor<T>> {
-        let mut cursor = self.free_tree.cursor_lower_bound(&(size, 0))?;
-        let ((_, offset), _) = cursor.current();
+        let free_cursor = self.free_tree.cursor_lower_bound(&(size, 0))?;
+        let ((_, offset), _) = free_cursor.current();
         self.tree.get_mut(&offset)
     }
 
@@ -48,17 +48,15 @@ impl<T> RangeAllocator<T> {
 
         self.free_tree.remove(&(found_size, found_offset));
 
-        if found_size == size {
-            return Ok(found_offset);
+        if found_size != size {
+            // We need to break up the descriptor
+            let new_offset = found_offset + size;
+            let new_size = found_size - size;
+            let desc = Descriptor::new(new_offset, new_size);
+            let (tree_node, free_tree_node) = alloc.initialize(desc);
+            self.tree.insert(tree_node);
+            self.free_tree.insert(free_tree_node);
         }
-
-        // We need to break up the descriptor
-        let new_offset = found_offset + size;
-        let new_size = found_size - size;
-        let desc = Descriptor::new(new_offset, new_size);
-        let (tree_node, free_tree_node) = alloc.initialize(desc);
-        self.tree.insert(tree_node);
-        self.free_tree.insert(free_tree_node);
 
         Ok(found_offset)
     }
@@ -70,12 +68,8 @@ impl<T> RangeAllocator<T> {
     pub(crate) fn reserve_new_noalloc(&mut self, size: usize) -> Result<Option<usize>> {
         let found = match self.find_best_match(size) {
             None => return Err(ENOMEM),
-            Some(found) => {
-                if found.size != size {
-                    return Ok(None);
-                }
-                found
-            }
+            Some(found) if found.size == size => found,
+            _ => return Ok(None)
         };
 
         found.state = DescriptorState::Reserved;
@@ -87,7 +81,7 @@ impl<T> RangeAllocator<T> {
 
     pub(crate) fn reservation_abort(&mut self, offset: usize) -> Result {
         let mut cursor = self.tree.cursor_lower_bound(&offset).ok_or(EINVAL)?;
-        let (_, desc) = cursor.current();
+        let (_, desc) = cursor.current_mut();
         match desc.state {
             DescriptorState::Free => return Err(EINVAL),
             DescriptorState::Allocated => return Err(EPERM),
@@ -101,34 +95,23 @@ impl<T> RangeAllocator<T> {
 
         desc.state = DescriptorState::Free;
 
+        // Merge next into current if next is free
         let remove_next = match cursor.peek_next() {
             Some((_, next)) if next.state == DescriptorState::Free => {
-                // Merge current with next
                 self.free_tree.remove(&(next.size, next.offset));
                 size += next.size;
                 true
             }
             _ => false,
         };
-
-        let (_, desc) = cursor.current();
         if remove_next {
+            let (_, desc) = cursor.current_mut();
             desc.size = size;
-            // We already checked that a next node exists,
-            // so next() will return it successfully.
-            cursor = cursor.next().unwrap();
-            // We know there are at least 2 nodes,
-            // so we can remove one safely.
-            cursor = cursor.remove_current().unwrap();
-            let (key, _) = cursor.current();
-            if key > &offset {
-                // We walked to the right when removing.
-                // Go back to the original position.
-                cursor = cursor.prev().unwrap()
-            }
+            cursor.remove_next();
         }
 
-        match cursor.peek_prev() {
+        // Merge current into prev if prev is free
+        match cursor.peek_prev_mut() {
             Some((_, prev)) if prev.state == DescriptorState::Free => {
                 // merge previous with current, remove current
                 self.free_tree.remove(&(prev.size, prev.offset));
@@ -424,9 +407,8 @@ mod tests {
     }
 
     fn assert_invariant_and_state(cursor: RBTreeCursor<'_, usize, Descriptor<usize>>, free_tree: &RBTree<(usize, usize), ()>, expected: &[DescriptorState]) {
-        let mut cursor = cursor;
         let mut index = 1;
-        let (key, mut desc) = cursor.current();
+        let (key, desc) = cursor.current();
 
         assert_eq!(key, &desc.offset);
         assert_eq!(expected[0], desc.state);
@@ -437,9 +419,9 @@ mod tests {
         }
 
         let mut last = (desc.offset, desc.size, desc.state);
-        let mut next = cursor.next();
+        let mut next = cursor.move_next();
 
-        while let Some(mut n) = next {
+        while let Some(n) = next {
             let (key, desc) = n.current();
             let (last_offset, last_size, last_state) = last;
 
@@ -463,7 +445,7 @@ mod tests {
 
             last = (desc.offset, desc.size, desc.state);
             index += 1;
-            next = n.next();
+            next = n.move_next();
         }
 
         assert!(expected.len() == index);

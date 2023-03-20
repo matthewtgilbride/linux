@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
 
-use core::ptr::NonNull;
 use kernel::{
     rbtree::{RBTree, RBTreeNode, RBTreeNodeReservation},
     macros::kunit_tests,
@@ -37,7 +36,10 @@ impl<T> RangeAllocator<T> {
     /// Try to reserve a new buffer, using the provided allocation if necessary.
     pub(crate) fn reserve_new(&mut self, size: usize, alloc: ReserveNewDescriptor<T>) -> Result<usize> {
         let (found_size, found_offset) = match self.find_best_match(size) {
-            None => return Err(ENOMEM),
+            None => {
+                pr_warn!("ENOMEM from range_alloc.reserve_new - size: {}", size);
+                return Err(ENOMEM);
+            },
             Some(desc) => {
                 let found = (desc.size, desc.offset);
                 desc.state = DescriptorState::Reserved;
@@ -67,7 +69,10 @@ impl<T> RangeAllocator<T> {
     /// `reserve_new`.
     pub(crate) fn reserve_new_noalloc(&mut self, size: usize) -> Result<Option<usize>> {
         let found = match self.find_best_match(size) {
-            None => return Err(ENOMEM),
+            None => {
+                pr_warn!("ENOMEM from range_alloc.reserve_new_noalloc - size: {}", size);
+                return Err(ENOMEM);
+            },
             Some(found) if found.size == size => found,
             _ => return Ok(None)
         };
@@ -83,8 +88,14 @@ impl<T> RangeAllocator<T> {
         let mut cursor = self.tree.cursor_lower_bound(&offset).ok_or(EINVAL)?;
         let (_, desc) = cursor.current_mut();
         match desc.state {
-            DescriptorState::Free => return Err(EINVAL),
-            DescriptorState::Allocated => return Err(EPERM),
+            DescriptorState::Free => {
+                pr_warn!("EINVAL from range_alloc.reservation_abort - offset: {}", offset);
+                return Err(EINVAL);
+            }
+            DescriptorState::Allocated => {
+                pr_warn!("EPERM from range_alloc.reservation_abort - offset: {}", offset);
+                return Err(EPERM);
+            },
             DescriptorState::Reserved => {}
         }
 
@@ -143,6 +154,7 @@ impl<T> RangeAllocator<T> {
     pub(crate) fn reserve_existing(&mut self, offset: usize) -> Result<(usize, Option<T>)> {
         let mut desc = self.tree.get_mut(&offset).ok_or(ENOENT)?;
         if desc.state != DescriptorState::Allocated {
+            pr_warn!("ENOENT from range_alloc.reserve_existing - offset: {}", offset);
             return Err(ENOENT);
         }
         desc.state = DescriptorState::Reserved;

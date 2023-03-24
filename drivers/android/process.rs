@@ -530,7 +530,11 @@ impl Process {
         let mut inner = self.inner.lock();
         let mapping = inner.mapping.as_mut().ok_or_else(BinderError::new_dead)?;
 
-        let offset = mapping.alloc.reserve_new(size)?;
+        let offset = mapping.alloc.reserve_new(
+            size,
+            false,
+            crate::range_alloc::ReserveNewBox::try_new()?,
+        )?;
         Ok(Allocation::new(
             self,
             offset,

@@ -8,3 +8,4 @@ obj-$(CONFIG_ANDROID_VENDOR_HOOKS) += vendor_hooks.o
 obj-$(CONFIG_ANDROID_DEBUG_KINFO)	+= debug_kinfo.o
 obj-$(CONFIG_ANDROID_MEMHEALTH)		+= memhealth.o
 obj-$(CONFIG_ANDROID_BINDER_IPC_RUST)	+= rust_binder.o
+obj-$(CONFIG_ANDROID_BINDERFS_RUST)	+= rust_binderfs.o

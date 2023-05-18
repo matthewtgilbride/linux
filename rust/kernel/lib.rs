@@ -36,6 +36,7 @@ pub mod init;
 pub mod ioctl;
 pub mod prelude;
 pub mod print;
+pub mod rbtree;
 mod static_assert;
 #[doc(hidden)]
 pub mod std_vendor;

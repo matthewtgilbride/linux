@@ -100,6 +100,43 @@ impl<'a, T: ForeignOwnable> Drop for Reservation<'a, T> {
 ///
 /// This structure is expected to often be used with an inner type that can either be efficiently
 /// cloned, such as an `Arc<T>`.
+/// 
+/// # Examples
+/// 
+/// In the following example we demonstrate basic insertion/retrieval with a `Box<u32>`.
+/// 
+/// ```
+/// use kernel::xarray::{XArray, flags::LOCK_IRQ};
+/// 
+/// let my_xarray: Box<XArray<Box<u32>>> = Box::try_new(XArray::new(LOCK_IRQ))?;
+/// let my_xarray = Box::into_pin(my_xarray);
+/// let my_xarray = my_xarray.as_ref();
+/// 
+/// assert!(my_xarray.get(1).is_none());
+/// 
+/// my_xarray.set(1, Box::try_new(1)?);
+/// assert_eq!(my_xarray.get(1).unwrap().borrow(), &1);
+/// 
+/// // Replacing with a new value returns the old value.
+/// let old = my_xarray.replace(1, Box::try_new(2)?)?;
+/// assert_eq!(old.unwrap().as_ref(), &1);
+/// assert_eq!(my_xarray.get(1).unwrap().borrow(), &2);
+/// 
+/// // Replacing a non-existent key returns `None`.
+/// let none = my_xarray.replace(2, Box::try_new(3)?)?;
+/// assert!(none.is_none());
+/// assert_eq!(my_xarray.get(2).unwrap().borrow(), &3);
+/// 
+/// // Removing an existent key returns the old value.
+/// let old = my_xarray.remove(2);
+/// assert_eq!(old.unwrap().as_ref(), &3);
+/// assert!(my_xarray.get(2).is_none());
+/// 
+/// // Removing a non-existent key returns `None`.
+/// assert!(my_xarray.remove(2).is_none());
+/// 
+/// # Ok::<(), Error>(())
+/// ```
 pub struct XArray<T: ForeignOwnable> {
     xa: Opaque<bindings::xarray>,
     _p: PhantomData<T>,

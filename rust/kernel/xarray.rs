@@ -117,6 +117,13 @@ impl<'a, T: ForeignOwnable> Drop for Reservation<'a, T> {
 /// my_xarray.set(1, Box::try_new(1)?);
 /// assert_eq!(my_xarray.get(1).unwrap().borrow(), &1);
 /// 
+/// // Calling `find` with an existent index returns it along with its value.
+/// assert_eq!(my_xarray.find(1).map(|(i,v)| (i, v.borrow().clone())).unwrap(), (1, 1));
+/// // Calling `find` with a non-existent index smaller than some existent index returns the next larger index/value pair.
+/// assert_eq!(my_xarray.find(0).map(|(i,v)| (i, v.borrow().clone())).unwrap(), (1, 1));
+/// // Calling `find` with an index larger than the largest existent one returns `None`.
+/// assert!(my_xarray.find(100).is_none());
+///
 /// // Replacing with a new value returns the old value.
 /// let old = my_xarray.replace(1, Box::try_new(2)?)?;
 /// assert_eq!(old.unwrap().as_ref(), &1);
@@ -220,6 +227,32 @@ impl<T: ForeignOwnable> XArray<T> {
             guard.dismiss();
             Guard(p, self)
         })
+    }
+
+    /// Looks up and returns a reference to an entry in the array returning `(index, Guard)`
+    /// if it exists. If the index doesn't exist, returns the next larger index/value pair,
+    /// else `None`.
+    ///
+    /// This guard blocks all other actions on the `XArray`. Callers are expected to drop the
+    /// `Guard` eagerly to avoid blocking other users, such as by taking a clone of the value.
+    pub fn find(self: Pin<&Self>, index: usize) -> Option<(usize, Guard<'_, T>)> {
+        // SAFETY: `self.xa` is always valid by the type invariant.
+        unsafe { bindings::xa_lock(self.xa.get()) };
+
+        let indexp = &mut index.try_into().ok()?;
+
+        // SAFETY: `self.xa` is always valud by the type invariant.
+        unsafe { bindings::xa_find(
+            self.xa.get(),
+            indexp,
+            core::ffi::c_ulong::MAX,
+            bindings::BINDINGS_XA_PRESENT,
+        ) };
+
+        let new_index = *indexp;
+        let new_index: usize = new_index.try_into().ok()?;
+
+        self.get(new_index).map(|g| (new_index, g))
     }
 
     /// Removes and returns an entry, returning it if it existed.

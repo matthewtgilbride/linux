@@ -51,6 +51,21 @@ impl<'a, T: ForeignOwnable> Guard<'a, T> {
     }
 }
 
+/// Wrapper for a mutable value owned by the `XArray` which holds the `XArray` lock until dropped.
+pub struct GuardMut<'a, T: ForeignOwnable>(NonNull<T>, Pin<&'a mut XArray<T>>);
+
+impl<'a, T: ForeignOwnable> GuardMut<'a, T> {
+    /// Mutably borrow the underlying value wrapped by the `Guard`.
+    ///
+    /// Returns a `T::BorrowMut` type for the owned `ForeignOwnable` type.
+    pub fn borrow_mut(&mut self) -> ScopeGuard<T, fn(T)> {
+        // SAFETY: The value is owned by the `XArray`, the lifetime it is borrowed for must not
+        // outlive the `XArray` itself, nor the Guard that holds the lock ensuring the value
+        // remains in the `XArray`.
+        unsafe { T::borrow_mut(self.0.as_ptr() as _) }
+    }
+}
+
 impl<'a, T: ForeignOwnable> Drop for Guard<'a, T> {
     fn drop(&mut self) {
         // SAFETY: The XArray we have a reference to owns the C xarray object.
@@ -117,9 +132,9 @@ impl<'a, T: ForeignOwnable> Drop for Reservation<'a, T> {
 /// my_xarray.set(1, Box::try_new(1)?);
 /// assert_eq!(my_xarray.get(1).unwrap().borrow(), &1);
 /// 
-/// // Calling `find` with an existent index returns it along with its value.
+/// // Calling `find` with an existent index returns the matching index/value pair.
 /// assert_eq!(my_xarray.find(1).map(|(i,v)| (i, v.borrow().clone())).unwrap(), (1, 1));
-/// // Calling `find` with a non-existent index smaller than some existent index returns the next larger index/value pair.
+/// // Calling `find` with a non-existent index returns the next larger index/value pair.
 /// assert_eq!(my_xarray.find(0).map(|(i,v)| (i, v.borrow().clone())).unwrap(), (1, 1));
 /// // Calling `find` with an index larger than the largest existent one returns `None`.
 /// assert!(my_xarray.find(100).is_none());
@@ -141,6 +156,63 @@ impl<'a, T: ForeignOwnable> Drop for Reservation<'a, T> {
 /// 
 /// // Removing a non-existent key returns `None`.
 /// assert!(my_xarray.remove(2).is_none());
+/// 
+/// 
+/// # Ok::<(), Error>(())
+/// ```
+/// 
+/// Let's try to do linked list stuff
+/// 
+/// ```
+/// use kernel::xarray::{XArray, flags::LOCK_IRQ};
+/// 
+/// let my_xarray: Box<XArray<Box<Vec<u32>>>> = Box::try_new(XArray::new(LOCK_IRQ))?;
+/// let mut my_xarray: Pin<Box<XArray<Box<Vec<u32>>>>> = Box::into_pin(my_xarray);
+/// 
+/// {
+///   // let's try to add a vec of size 1 in there...
+///
+///   let mut my_vec = Vec::new();
+///   my_vec.try_push(1)?;
+///
+///   my_xarray.as_ref().set(1, Box::try_new(my_vec)?);
+///
+///   // let's inspect the vec to see if it has a 2 in it
+///   let found_vec = my_xarray.as_ref().get(1).unwrap();
+///   let found_elem = found_vec.borrow().iter().find(|&v| v == &1);
+///   assert!(found_elem.is_some());
+///   let found_elem = found_vec.borrow().iter().find(|&v| v == &2);
+///   assert!(found_elem.is_none());
+///
+///   // great...but now is there any way to modify it but by replacing?
+///   let mut new_vec = Vec::new();
+///   for v in found_vec.borrow().iter() {
+///       new_vec.try_push(*v)?;
+///   }
+///   new_vec.try_push(2);
+///   my_xarray.as_ref().replace(1, Box::try_new(new_vec)?);
+///
+///   // make sure the new element is there
+///   let found_vec = my_xarray.as_ref().get(1).unwrap();
+///   let found_elem = found_vec.borrow().iter().find(|&v| v == &1);
+///   assert!(found_elem.is_some());
+///   let found_elem = found_vec.borrow().iter().find(|&v| v == &2);
+///   assert!(found_elem.is_some());
+/// }
+/// 
+/// {
+///   // ok let's do things mutably
+///   let mut found_vec = my_xarray.as_mut().get_mutable(1).unwrap();
+///   found_vec.borrow_mut().try_push(3)?;
+/// }
+/// 
+/// let found_vec = my_xarray.as_ref().get(1).unwrap();
+/// let found_elem = found_vec.borrow().iter().find(|&v| v == &1);
+/// assert!(found_elem.is_some());
+/// let found_elem = found_vec.borrow().iter().find(|&v| v == &2);
+/// assert!(found_elem.is_some());
+/// let found_elem = found_vec.borrow().iter().find(|&v| v == &3);
+/// assert!(found_elem.is_some());
 /// 
 /// # Ok::<(), Error>(())
 /// ```
@@ -227,6 +299,28 @@ impl<T: ForeignOwnable> XArray<T> {
             guard.dismiss();
             Guard(p, self)
         })
+    }
+
+    /// Looks up and returns a reference to an entry in the array, returning a `Guard` if it
+    /// exists.
+    ///
+    /// This guard blocks all other actions on the `XArray`. Callers are expected to drop the
+    /// `Guard` eagerly to avoid blocking other users, such as by taking a clone of the value.
+    pub fn get_mutable(self: Pin<&mut Self>, index: usize) -> Option<GuardMut<'_, T>> {
+        // SAFETY: `self.xa` is always valid by the type invariant.
+        unsafe { bindings::xa_lock(self.xa.get()) };
+
+        // SAFETY: `self.xa` is always valid by the type invariant.
+        let p = unsafe { bindings::xa_load(self.xa.get(), index.try_into().ok()?) };
+
+        match NonNull::new(p as *mut T) {
+            Some(p) => Some(GuardMut(p, self)),
+            None => {
+                // SAFETY: `self.xa` is always valid by the type invariant.
+                unsafe { bindings::xa_unlock(self.xa.get()) };
+                None
+            }
+        }
     }
 
     /// Looks up and returns a reference to an entry in the array returning `(index, Guard)`

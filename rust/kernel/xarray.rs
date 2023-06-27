@@ -58,6 +58,28 @@ impl<'a, T: ForeignOwnable> Drop for ValueGuard<'a, T> {
     }
 }
 
+/// Wrapper for a *mutable* value owned by the `XArray` which holds the `XArray` lock until dropped.
+pub struct ValueGuardMut<'a, T: ForeignOwnable>(NonNull<T>, Pin<&'a mut XArray<T>>);
+
+impl<'a, T: ForeignOwnable> ValueGuardMut<'a, T> {
+    /// Borrow the underlying value wrapped by the `ValueGuard`.
+    ///
+    /// Returns a `T::Borrowed` type for the owned `ForeignOwnable` type.
+    pub fn borrow_mut(&mut self) -> ScopeGuard<T, fn(T)> {
+        // SAFETY: The value is owned by the `XArray`, the lifetime it is borrowed for must not
+        // outlive the `XArray` itself, nor the `ValueGuard` that holds the lock ensuring the value
+        // remains in the `XArray`.
+        unsafe { T::borrow_mut(self.0.as_ptr() as _) }
+    }
+}
+
+impl<'a, T: ForeignOwnable> Drop for ValueGuardMut<'a, T> {
+    fn drop(&mut self) {
+        // SAFETY: The XArray we have a reference to owns the C xarray object.
+        unsafe { bindings::xa_unlock(self.1.xa.get()) };
+    }
+}
+
 /// An array which efficiently maps sparse integer indices to owned objects.
 ///
 /// This is similar to a `Vec<Option<T>>`, but more efficient when there are holes in the
@@ -109,6 +131,52 @@ impl<'a, T: ForeignOwnable> Drop for ValueGuard<'a, T> {
 ///
 /// # Ok::<(), Error>(())
 /// ```
+///
+/// In this example, we create a new `XArray` and demonstrate
+/// how to mutably access values.
+///
+/// ```
+/// use kernel::xarray::{XArray, flags::LOCK_IRQ};
+///
+/// let xarr: Box<XArray<Box<usize>>> = Box::try_new(XArray::new(LOCK_IRQ))?;
+/// let mut xarr: Pin<Box<XArray<Box<usize>>>> = Box::into_pin(xarr);
+///
+/// // Create scopes so that references can be dropped
+/// // in order to take a new, mutable/immutable ones afterwards.
+/// {
+///     let xarr = xarr.as_ref();
+///     assert!(xarr.get(1).is_none());
+///     xarr.set(1, Box::try_new(1)?);
+///     assert_eq!(xarr.get(1).unwrap().borrow(), &1);
+/// }
+///
+/// {
+///     let xarr = xarr.as_mut();
+///     let mut value = xarr.get_mutable(1).unwrap().borrow_mut();
+///     *(value.as_mut()) = 2;
+/// }
+///
+/// {
+///     let xarr = xarr.as_ref();
+///     assert_eq!(xarr.get(1).unwrap().borrow(), &2);
+/// }
+///
+/// // `find_mut` can equivalently be used for mutation.
+/// {
+///     let xarr = xarr.as_mut();
+///     let (index, mut value_guard) = xarr.find_mut(0).unwrap();
+///     assert_eq!(index, 1);
+///     *(value_guard.borrow_mut().as_mut()) = 3;
+/// }
+///
+/// {
+///     let xarr = xarr.as_ref();
+///     assert_eq!(xarr.get(1).unwrap().borrow(), &3);
+/// }
+///
+/// # Ok::<(), Error>(())
+/// ```
+///
 pub struct XArray<T: ForeignOwnable> {
     xa: Opaque<bindings::xarray>,
     _p: PhantomData<T>,
@@ -194,6 +262,30 @@ impl<T: ForeignOwnable> XArray<T> {
         })
     }
 
+    /// Looks up and returns a *mutable* reference to an entry in the array, returning a `ValueGuardMut` if it
+    /// exists.
+    ///
+    /// This guard blocks all other actions on the `XArray`. Callers are expected to drop the
+    /// `ValueGuardMut` eagerly to avoid blocking other users, such as by taking a clone of the value.
+    pub fn get_mutable(self: Pin<&mut Self>, index: usize) -> Option<ValueGuardMut<'_, T>> {
+        // SAFETY: `self.xa` is always valid by the type invariant.
+        unsafe { bindings::xa_lock(self.xa.get()) };
+
+        // SAFETY: `self.xa` is always valid by the type invariant.
+        let guard = ScopeGuard::new(|| unsafe { bindings::xa_unlock(self.xa.get()) });
+
+        // SAFETY: `self.xa` is always valid by the type invariant.
+        let p = unsafe { bindings::xa_load(self.xa.get(), index.try_into().ok()?) };
+
+        match NonNull::new(p as *mut T) {
+            Some(p) => {
+                guard.dismiss();
+                Some(ValueGuardMut(p, self))
+            }
+            None => None,
+        }
+    }
+
     /// Looks up and returns a reference to an entry in the array, returning `(index, ValueGuard)`
     /// if it exists. If the index doesn't exist, returns the next larger index/value pair,
     /// else `None`.
@@ -229,6 +321,46 @@ impl<T: ForeignOwnable> XArray<T> {
             guard.dismiss();
             (new_index, ValueGuard(p, self))
         })
+    }
+
+    /// Looks up and returns a *mutable* reference to an entry in the array, returning `(index, ValueGuardMut)`
+    /// if it exists. If the index doesn't exist, returns the next larger index/value pair,
+    /// else `None`.
+    ///
+    /// This guard blocks all other actions on the `XArray`. Callers are expected to drop the
+    /// `ValueGuardMut` eagerly to avoid blocking other users, such as by taking a clone of the value.
+    pub fn find_mut(self: Pin<&mut Self>, index: usize) -> Option<(usize, ValueGuardMut<'_, T>)> {
+        // SAFETY: `self.xa` is always valid by the type invariant.
+        unsafe { bindings::xa_lock(self.xa.get()) };
+
+        // SAFETY: `self.xa` is always valid by the type invariant.
+        let guard = ScopeGuard::new(|| unsafe { bindings::xa_unlock(self.xa.get()) });
+
+        let indexp = &mut index.try_into().ok()?;
+        // SAFETY: `self.xa` is always valud by the type invariant.
+        unsafe {
+            bindings::xa_find(
+                self.xa.get(),
+                indexp,
+                core::ffi::c_ulong::MAX,
+                bindings::BINDINGS_XA_PRESENT,
+            )
+        };
+
+        let new_index = *indexp;
+
+        // SAFETY: `self.xa` is always valid by the type invariant.
+        let p = unsafe { bindings::xa_load(self.xa.get(), new_index) };
+
+        let new_index: usize = new_index.try_into().ok()?;
+
+        match NonNull::new(p as *mut T) {
+            Some(p) => {
+                guard.dismiss();
+                Some((new_index, ValueGuardMut(p, self)))
+            }
+            None => None,
+        }
     }
 
     /// Removes and returns an entry, returning it if it existed.

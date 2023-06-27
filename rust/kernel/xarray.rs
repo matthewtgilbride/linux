@@ -66,6 +66,49 @@ impl<'a, T: ForeignOwnable> Drop for ValueGuard<'a, T> {
 /// This structure is expected to often be used with an inner type that can be efficiently
 /// cloned, such as an `Arc<T>`.
 ///
+/// # Examples
+///
+/// In this example, we create a new `XArray` and demonstrate
+/// rudimentary read/write operations.
+///
+/// ```
+/// use kernel::xarray::{XArray, flags::LOCK_IRQ};
+///
+/// let xarr: Box<XArray<Box<usize>>> = Box::try_new(XArray::new(LOCK_IRQ))?;
+/// let xarr: Pin<Box<XArray<Box<usize>>>> = Box::into_pin(xarr);
+/// let xarr: Pin<&XArray<Box<usize>>> = xarr.as_ref();
+///
+/// assert!(xarr.get(0).is_none());
+///
+/// xarr.set(0, Box::try_new(0)?);
+/// assert_eq!(xarr.get(0).unwrap().borrow(), &0);
+///
+/// // `replace` is like `set`, but returns the old value.
+/// let old = xarr.replace(0, Box::try_new(1)?)?.unwrap();
+/// assert_eq!(old.as_ref(), &0);
+/// assert_eq!(xarr.get(0).unwrap().borrow(), &1);
+///
+/// // `replace` returns `None` if there was no previous value.
+/// assert!(xarr.replace(1, Box::try_new(1)?)?.is_none());
+/// assert_eq!(xarr.get(1).unwrap().borrow(), &1);
+///
+/// // Similarly, `remove` returns the old value, or `None` if it didn't exist.
+/// assert_eq!(xarr.remove(0).unwrap().as_ref(), &1);
+/// assert!(xarr.get(0).is_none());
+/// assert!(xarr.remove(0).is_none());
+///
+/// // `find` returns the index/value pair matching the index, the next larger
+/// // index/value pair if it doesn't exist, or `None` of no larger index exists.
+/// let (found_index, found_value) = xarr.find(1).unwrap();
+/// assert_eq!(found_index, 1);
+/// assert_eq!(found_value.borrow(), &1);
+/// let (found_index, found_value) = xarr.find(0).unwrap();
+/// assert_eq!(found_index, 1);
+/// assert_eq!(found_value.borrow(), &1);
+/// assert!(xarr.find(2).is_none());
+///
+/// # Ok::<(), Error>(())
+/// ```
 pub struct XArray<T: ForeignOwnable> {
     xa: Opaque<bindings::xarray>,
     _p: PhantomData<T>,

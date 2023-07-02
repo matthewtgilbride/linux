@@ -129,85 +129,24 @@ impl<'a, T: ForeignOwnable> Drop for Reservation<'a, T> {
 /// rudimentary read/write operations.
 ///
 /// ```
-/// use kernel::xarray::{XArray, flags::LOCK_IRQ};
+/// use core::{
+///     borrow::Borrow,
+///     ops::Deref
+/// };
+/// use kernel::{
+///     sync::Arc,
+///     xarray::{XArray, flags::LOCK_IRQ}
+/// };
 ///
-/// let xarr: Box<XArray<Box<usize>>> = Box::try_new(XArray::new(LOCK_IRQ))?;
-/// let xarr: Pin<Box<XArray<Box<usize>>>> = Box::into_pin(xarr);
-/// let xarr: Pin<&XArray<Box<usize>>> = xarr.as_ref();
+/// let xarr: Box<XArray<Arc<usize>>> = Box::try_new(XArray::new(LOCK_IRQ))?;
+/// let xarr: Pin<Box<XArray<Arc<usize>>>> = Box::into_pin(xarr);
+/// let xarr: Pin<&XArray<Arc<usize>>> = xarr.as_ref();
 ///
 /// assert!(xarr.get(0).is_none());
 ///
-/// xarr.set(0, Box::try_new(0)?);
-/// assert_eq!(xarr.get(0).unwrap().borrow(), &0);
-///
-/// // `replace` is like `set`, but returns the old value.
-/// let old = xarr.replace(0, Box::try_new(1)?)?.unwrap();
-/// assert_eq!(old.as_ref(), &0);
-/// assert_eq!(xarr.get(0).unwrap().borrow(), &1);
-///
-/// // `replace` returns `None` if there was no previous value.
-/// assert!(xarr.replace(1, Box::try_new(1)?)?.is_none());
-/// assert_eq!(xarr.get(1).unwrap().borrow(), &1);
-///
-/// // Similarly, `remove` returns the old value, or `None` if it didn't exist.
-/// assert_eq!(xarr.remove(0).unwrap().as_ref(), &1);
-/// assert!(xarr.get(0).is_none());
-/// assert!(xarr.remove(0).is_none());
-///
-/// // `find` returns the index/value pair matching the index, the next larger
-/// // index/value pair if it doesn't exist, or `None` of no larger index exists.
-/// let (found_index, found_value) = xarr.find(1).unwrap();
-/// assert_eq!(found_index, 1);
-/// assert_eq!(found_value.borrow(), &1);
-/// let (found_index, found_value) = xarr.find(0).unwrap();
-/// assert_eq!(found_index, 1);
-/// assert_eq!(found_value.borrow(), &1);
-/// assert!(xarr.find(2).is_none());
-///
-/// # Ok::<(), Error>(())
-/// ```
-///
-/// In this example, we create a new `XArray` and demonstrate
-/// how to mutably access values.
-///
-/// ```
-/// use kernel::xarray::{XArray, flags::LOCK_IRQ};
-///
-/// let xarr: Box<XArray<Box<usize>>> = Box::try_new(XArray::new(LOCK_IRQ))?;
-/// let mut xarr: Pin<Box<XArray<Box<usize>>>> = Box::into_pin(xarr);
-///
-/// // Create scopes so that references can be dropped
-/// // in order to take a new, mutable/immutable ones afterwards.
-/// {
-///     let xarr = xarr.as_ref();
-///     assert!(xarr.get(1).is_none());
-///     xarr.set(1, Box::try_new(1)?);
-///     assert_eq!(xarr.get(1).unwrap().borrow(), &1);
-/// }
-///
-/// {
-///     let xarr = xarr.as_mut();
-///     let mut value = xarr.get_mutable(1).unwrap().borrow_mut();
-///     *(value.as_mut()) = 2;
-/// }
-///
-/// {
-///     let xarr = xarr.as_ref();
-///     assert_eq!(xarr.get(1).unwrap().borrow(), &2);
-/// }
-///
-/// // `find_mut` can equivalently be used for mutation.
-/// {
-///     let xarr = xarr.as_mut();
-///     let (index, mut value_guard) = xarr.find_mut(0).unwrap();
-///     assert_eq!(index, 1);
-///     *(value_guard.borrow_mut().as_mut()) = 3;
-/// }
-///
-/// {
-///     let xarr = xarr.as_ref();
-///     assert_eq!(xarr.get(1).unwrap().borrow(), &3);
-/// }
+/// xarr.set(0, Arc::try_new(0)?);
+/// let wut_null_pointer_deref = xarr.get(0).unwrap();
+/// assert_eq!(wut_null_pointer_deref.as_ref(), &0);
 ///
 /// # Ok::<(), Error>(())
 /// ```
@@ -276,49 +215,64 @@ impl<T: ForeignOwnable> XArray<T> {
         Ok(())
     }
 
-    /// Looks up and returns a reference to an entry in the array, returning a `ValueGuard` if it
-    /// exists.
+    /// Looks up a reference to an entry in the array, cloning it
+    /// and returning the cloned value to the user.
     ///
-    /// This guard blocks all other actions on the `XArray`. Callers are expected to drop the
-    /// `ValueGuard` eagerly to avoid blocking other users, such as by taking a clone of the value.
-    pub fn get(self: Pin<&Self>, index: usize) -> Option<ValueGuard<'_, T>> {
+    pub fn get(self: Pin<&Self>, index: u64) -> Option<T>
+    where
+        T: Clone,
+    {
         // SAFETY: `self.xa` is always valid by the type invariant.
         unsafe { bindings::xa_lock(self.xa.get()) };
 
         // SAFETY: `self.xa` is always valid by the type invariant.
-        let guard = ScopeGuard::new(|| unsafe { bindings::xa_unlock(self.xa.get()) });
+        let p = unsafe { bindings::xa_load(self.xa.get(), index) } as *const T;
+
+        let t = NonNull::new(p as *mut T).map(|p| unsafe { p.as_ref() }).cloned();
 
         // SAFETY: `self.xa` is always valid by the type invariant.
-        let p = unsafe { bindings::xa_load(self.xa.get(), index.try_into().ok()?) };
+        unsafe { bindings::xa_unlock(self.xa.get()) };
 
-        NonNull::new(p as *mut T).map(|p| {
-            guard.dismiss();
-            ValueGuard(p, self)
-        })
+        t
     }
 
-    /// Looks up and returns a *mutable* reference to an entry in the array, returning a `ValueGuardMut` if it
-    /// exists.
+    /// Looks up and a reference to an entry in the array, calling the user
+    /// provided function on the resulting `Option<&T>` to return a value
+    /// computed from the reference. Use this function if you need shared
+    /// access to a `&T` that is not `Clone`.
     ///
-    /// This guard blocks all other actions on the `XArray`. Callers are expected to drop the
-    /// `ValueGuardMut` eagerly to avoid blocking other users, such as by taking a clone of the value.
-    pub fn get_mutable(self: Pin<&mut Self>, index: usize) -> Option<ValueGuardMut<'_, T>> {
+    pub fn get_shared<F, R>(self: Pin<&mut Self>, index: u64, f: F) -> R
+    where
+        F: FnOnce(Option<&T>) -> R,
+    {
         // SAFETY: `self.xa` is always valid by the type invariant.
         unsafe { bindings::xa_lock(self.xa.get()) };
 
         // SAFETY: `self.xa` is always valid by the type invariant.
-        let guard = ScopeGuard::new(|| unsafe { bindings::xa_unlock(self.xa.get()) });
+        let p = unsafe { bindings::xa_load(self.xa.get(), index) };
+        let t: Option<&T> = unsafe { NonNull::new(p as *mut T).map(|p| p.as_ref()) };
+        let r = f(t);
 
         // SAFETY: `self.xa` is always valid by the type invariant.
-        let p = unsafe { bindings::xa_load(self.xa.get(), index.try_into().ok()?) };
+        unsafe { bindings::xa_unlock(self.xa.get()) };
 
-        match NonNull::new(p as *mut T) {
-            Some(p) => {
-                guard.dismiss();
-                Some(ValueGuardMut(p, self))
-            }
-            None => None,
-        }
+        r
+    }
+
+    /// Looks up and returns a *mutable* reference to an entry in the array.
+    pub fn get_mutable(self: Pin<&mut Self>, index: u64) -> Option<&mut T> {
+        // SAFETY: `self.xa` is always valid by the type invariant.
+        unsafe { bindings::xa_lock(self.xa.get()) };
+
+        // SAFETY: `self.xa` is always valid by the type invariant.
+        let p = unsafe { bindings::xa_load(self.xa.get(), index) };
+
+        let t = NonNull::new(p as *mut T).map(|mut p| unsafe { p.as_mut() });
+
+        // SAFETY: `self.xa` is always valid by the type invariant.
+        unsafe { bindings::xa_unlock(self.xa.get()) };
+
+        t
     }
 
     /// Looks up and returns a reference to an entry in the array, returning `(index, ValueGuard)`

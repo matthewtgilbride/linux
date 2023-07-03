@@ -5,6 +5,7 @@
 use kernel::{
     bindings::{self, seq_file},
     file::{File, PollTable},
+    io_buffer::IoBufferWriter,
     linked_list::{GetLinks, GetLinksWrapped, Links},
     prelude::*,
     sync::Arc,
@@ -14,12 +15,15 @@ use kernel::{
 
 use crate::{context::Context, process::Process, thread::Thread};
 
+mod allocation;
 mod context;
 mod defs;
 mod error;
 mod node;
 mod process;
+mod range_alloc;
 mod thread;
+mod transaction;
 
 module! {
     type: BinderModule,
@@ -71,6 +75,38 @@ impl GetLinks for DeliverToReadListAdapter {
 
 impl GetLinksWrapped for DeliverToReadListAdapter {
     type Wrapped = Arc<dyn DeliverToRead>;
+}
+
+struct DeliverCode {
+    code: u32,
+    links: Links<dyn DeliverToRead>,
+}
+
+impl DeliverCode {
+    fn new(code: u32) -> Self {
+        Self {
+            code,
+            links: Links::new(),
+        }
+    }
+}
+
+impl DeliverToRead for DeliverCode {
+    fn do_work(self: Arc<Self>, _thread: &Thread, writer: &mut UserSlicePtrWriter) -> Result<bool> {
+        writer.write(&self.code)?;
+        Ok(true)
+    }
+    fn get_links(&self) -> &Links<dyn DeliverToRead> {
+        &self.links
+    }
+    fn should_sync_wakeup(&self) -> bool {
+        false
+    }
+}
+
+const fn ptr_align(value: usize) -> usize {
+    let size = core::mem::size_of::<usize>() - 1;
+    (value + size) & !size
 }
 
 struct BinderModule {}

@@ -36,85 +36,6 @@ pub mod flags {
     pub const ALLOC1: super::Flags = bindings::BINDINGS_XA_FLAGS_ALLOC1;
 }
 
-/// Wrapper for a value owned by the `XArray` which holds the `XArray` lock until dropped.
-pub struct ValueGuard<'a, T: ForeignOwnable>(NonNull<T>, Pin<&'a XArray<T>>);
-
-impl<'a, T: ForeignOwnable> ValueGuard<'a, T> {
-    /// Borrow the underlying value wrapped by the `ValueGuard`.
-    ///
-    /// Returns a `T::Borrowed` type for the owned `ForeignOwnable` type.
-    pub fn borrow(&self) -> T::Borrowed<'_> {
-        // SAFETY: The value is owned by the `XArray`, the lifetime it is borrowed for must not
-        // outlive the `XArray` itself, nor the `ValueGuard` that holds the lock ensuring the value
-        // remains in the `XArray`.
-        unsafe { T::borrow(self.0.as_ptr() as _) }
-    }
-}
-
-impl<'a, T: ForeignOwnable> Drop for ValueGuard<'a, T> {
-    fn drop(&mut self) {
-        // SAFETY: The XArray we have a reference to owns the C xarray object.
-        unsafe { bindings::xa_unlock(self.1.xa.get()) };
-    }
-}
-
-/// Wrapper for a *mutable* value owned by the `XArray` which holds the `XArray` lock until dropped.
-pub struct ValueGuardMut<'a, T: ForeignOwnable>(NonNull<T>, Pin<&'a mut XArray<T>>);
-
-impl<'a, T: ForeignOwnable> ValueGuardMut<'a, T> {
-    /// Borrow the underlying value wrapped by the `ValueGuard`.
-    ///
-    /// Returns a `T::Borrowed` type for the owned `ForeignOwnable` type.
-    pub fn borrow_mut(&mut self) -> ScopeGuard<T, fn(T)> {
-        // SAFETY: The value is owned by the `XArray`, the lifetime it is borrowed for must not
-        // outlive the `XArray` itself, nor the `ValueGuard` that holds the lock ensuring the value
-        // remains in the `XArray`.
-        unsafe { T::borrow_mut(self.0.as_ptr() as _) }
-    }
-}
-
-impl<'a, T: ForeignOwnable> Drop for ValueGuardMut<'a, T> {
-    fn drop(&mut self) {
-        // SAFETY: The XArray we have a reference to owns the C xarray object.
-        unsafe { bindings::xa_unlock(self.1.xa.get()) };
-    }
-}
-
-/// Represents a reserved slot in an `XArray`, which does not yet have a value but has an assigned
-/// index and may not be allocated by any other user. If the Reservation is dropped without
-/// being filled, the entry is marked as available again.
-///
-/// Users must ensure that reserved slots are not filled by other mechanisms, or otherwise their
-/// contents may be dropped and replaced (which will print a warning).
-pub struct Reservation<'a, T: ForeignOwnable>(Pin<&'a XArray<T>>, usize, PhantomData<T>);
-
-impl<'a, T: ForeignOwnable> Reservation<'a, T> {
-    /// Stores a value into the reserved slot.
-    pub fn store(self, value: T) -> Result<usize> {
-        if self.0.replace(self.1, value)?.is_some() {
-            crate::pr_err!("XArray: Reservation stored but the entry already had data!\n");
-            // Consider it a success anyway, not much we can do
-        }
-        let index = self.1;
-        // The reservation is now fulfilled, so do not run our destructor.
-        core::mem::forget(self);
-        Ok(index)
-    }
-
-    /// Returns the index of this reservation.
-    pub fn index(&self) -> usize {
-        self.1
-    }
-}
-
-impl<'a, T: ForeignOwnable> Drop for Reservation<'a, T> {
-    fn drop(&mut self) {
-        if self.0.remove(self.1).is_some() {
-            crate::pr_err!("XArray: Reservation dropped but the entry was not empty!\n");
-        }
-    }
-}
-
 /// An array which efficiently maps sparse integer indices to owned objects.
 ///
 /// This is similar to a `Vec<Option<T>>`, but more efficient when there are holes in the
@@ -129,10 +50,6 @@ impl<'a, T: ForeignOwnable> Drop for Reservation<'a, T> {
 /// rudimentary read/write operations.
 ///
 /// ```
-/// use core::{
-///     borrow::Borrow,
-///     ops::Deref
-/// };
 /// use kernel::{
 ///     sync::Arc,
 ///     xarray::{XArray, flags::LOCK_IRQ}
@@ -142,11 +59,62 @@ impl<'a, T: ForeignOwnable> Drop for Reservation<'a, T> {
 /// let xarr: Pin<Box<XArray<Arc<usize>>>> = Box::into_pin(xarr);
 /// let xarr: Pin<&XArray<Arc<usize>>> = xarr.as_ref();
 ///
+/// // `get` and `set` are used to read/write values.
 /// assert!(xarr.get(0).is_none());
-///
 /// xarr.set(0, Arc::try_new(0)?);
-/// let wut_null_pointer_deref = xarr.get(0).unwrap();
-/// assert_eq!(wut_null_pointer_deref.as_ref(), &0);
+/// assert_eq!(*xarr.get(0).unwrap(), 0);
+///
+/// // `replace` is like `set`, but returns the old value.
+/// let old = xarr.replace(0, Arc::try_new(1)?)?.unwrap();
+/// assert_eq!(*old, 0);
+/// assert_eq!(*xarr.get(0).unwrap(), 1);
+///
+/// // `replace` returns `None` if there was no previous value.
+/// assert!(xarr.replace(1, Arc::try_new(1)?)?.is_none());
+/// assert_eq!(*xarr.get(1).unwrap(), 1);
+///
+/// // Similarly, `remove` returns the old value, or `None` if it didn't exist.
+/// assert_eq!(*xarr.remove(0).unwrap(), 1);
+/// assert!(xarr.get(0).is_none());
+/// assert!(xarr.remove(0).is_none());
+///
+/// # Ok::<(), Error>(())
+/// ```
+///
+/// In this example, we create a new `XArray` and demonstrate
+/// reading values that are not `Clone`, as well as mutating values.
+///
+/// ```
+/// use core::{
+///     borrow::Borrow,
+///     ops::{ Deref, DerefMut }
+/// };
+/// use kernel::xarray::{XArray, flags::LOCK_IRQ};
+///
+/// let xarr: Box<XArray<Box<usize>>> = Box::try_new(XArray::new(LOCK_IRQ))?;
+/// let mut xarr: Pin<Box<XArray<Box<usize>>>> = Box::into_pin(xarr);
+///
+/// // Create scopes so that references can be dropped
+/// // in order to take a new, mutable/immutable ones afterwards.
+/// {
+///   let xarr: Pin<&XArray<Box<usize>>> = xarr.as_ref();
+///   // If the type is not `Clone`, use `get_shared` to access a shared reference
+///   // from a closure.
+///   assert!(xarr.get_shared(0, |x| x.is_none()));
+///   xarr.set(0, Box::try_new(0)?);
+///   xarr.get_shared(0, |x| assert_eq!(*x.unwrap(), 0));
+/// }
+/// {
+///   let mut xarr = xarr.as_mut();
+///   let mut value = xarr.get_mutable(0).unwrap();
+///   let mut value = value.deref_mut().as_mut();
+///   assert_eq!(value, &mut 0);
+///   *value = 1;
+/// }
+/// {
+///   let xarr = xarr.as_ref();
+///   xarr.get_shared(0, |x| assert_eq!(*x.unwrap(), 1));
+/// }
 ///
 /// # Ok::<(), Error>(())
 /// ```
@@ -218,7 +186,7 @@ impl<T: ForeignOwnable> XArray<T> {
     /// Looks up a reference to an entry in the array, cloning it
     /// and returning the cloned value to the user.
     ///
-    pub fn get(self: Pin<&Self>, index: u64) -> Option<T>
+    pub fn get(self: Pin<&Self>, index: u64) -> Option<T::Borrowed<'_>>
     where
         T: Clone,
     {
@@ -228,7 +196,7 @@ impl<T: ForeignOwnable> XArray<T> {
         // SAFETY: `self.xa` is always valid by the type invariant.
         let p = unsafe { bindings::xa_load(self.xa.get(), index) } as *const T;
 
-        let t = NonNull::new(p as *mut T).map(|p| unsafe { p.as_ref() }).cloned();
+        let t = NonNull::new(p as *mut T).map(|p| unsafe { T::borrow(p.clone().as_ptr() as _) });
 
         // SAFETY: `self.xa` is always valid by the type invariant.
         unsafe { bindings::xa_unlock(self.xa.get()) };
@@ -241,16 +209,16 @@ impl<T: ForeignOwnable> XArray<T> {
     /// computed from the reference. Use this function if you need shared
     /// access to a `&T` that is not `Clone`.
     ///
-    pub fn get_shared<F, R>(self: Pin<&mut Self>, index: u64, f: F) -> R
+    pub fn get_shared<F, R>(self: Pin<&Self>, index: u64, f: F) -> R
     where
-        F: FnOnce(Option<&T>) -> R,
+        F: FnOnce(Option<T::Borrowed<'_>>) -> R,
     {
         // SAFETY: `self.xa` is always valid by the type invariant.
         unsafe { bindings::xa_lock(self.xa.get()) };
 
         // SAFETY: `self.xa` is always valid by the type invariant.
         let p = unsafe { bindings::xa_load(self.xa.get(), index) };
-        let t: Option<&T> = unsafe { NonNull::new(p as *mut T).map(|p| p.as_ref()) };
+        let t = NonNull::new(p as *mut T).map(|p| unsafe { T::borrow(p.as_ptr() as _) });
         let r = f(t);
 
         // SAFETY: `self.xa` is always valid by the type invariant.
@@ -260,96 +228,19 @@ impl<T: ForeignOwnable> XArray<T> {
     }
 
     /// Looks up and returns a *mutable* reference to an entry in the array.
-    pub fn get_mutable(self: Pin<&mut Self>, index: u64) -> Option<&mut T> {
+    pub fn get_mutable(self: Pin<&mut Self>, index: u64) -> Option<ScopeGuard<T, fn(T)>> {
         // SAFETY: `self.xa` is always valid by the type invariant.
         unsafe { bindings::xa_lock(self.xa.get()) };
 
         // SAFETY: `self.xa` is always valid by the type invariant.
         let p = unsafe { bindings::xa_load(self.xa.get(), index) };
 
-        let t = NonNull::new(p as *mut T).map(|mut p| unsafe { p.as_mut() });
+        let t = NonNull::new(p as *mut T).map(|p| unsafe { T::borrow_mut(p.as_ptr() as _) });
 
         // SAFETY: `self.xa` is always valid by the type invariant.
         unsafe { bindings::xa_unlock(self.xa.get()) };
 
         t
-    }
-
-    /// Looks up and returns a reference to an entry in the array, returning `(index, ValueGuard)`
-    /// if it exists. If the index doesn't exist, returns the next larger index/value pair,
-    /// else `None`.
-    ///
-    /// This guard blocks all other actions on the `XArray`. Callers are expected to drop the
-    /// `ValueGuard` eagerly to avoid blocking other users, such as by taking a clone of the value.
-    pub fn find(self: Pin<&Self>, index: usize) -> Option<(usize, ValueGuard<'_, T>)> {
-        // SAFETY: `self.xa` is always valid by the type invariant.
-        unsafe { bindings::xa_lock(self.xa.get()) };
-
-        // SAFETY: `self.xa` is always valid by the type invariant.
-        let guard = ScopeGuard::new(|| unsafe { bindings::xa_unlock(self.xa.get()) });
-
-        let indexp = &mut index.try_into().ok()?;
-        // SAFETY: `self.xa` is always valud by the type invariant.
-        unsafe {
-            bindings::xa_find(
-                self.xa.get(),
-                indexp,
-                core::ffi::c_ulong::MAX,
-                bindings::BINDINGS_XA_PRESENT,
-            )
-        };
-
-        let new_index = *indexp;
-
-        // SAFETY: `self.xa` is always valid by the type invariant.
-        let p = unsafe { bindings::xa_load(self.xa.get(), new_index) };
-
-        let new_index: usize = new_index.try_into().ok()?;
-
-        NonNull::new(p as *mut T).map(|p| {
-            guard.dismiss();
-            (new_index, ValueGuard(p, self))
-        })
-    }
-
-    /// Looks up and returns a *mutable* reference to an entry in the array, returning `(index, ValueGuardMut)`
-    /// if it exists. If the index doesn't exist, returns the next larger index/value pair,
-    /// else `None`.
-    ///
-    /// This guard blocks all other actions on the `XArray`. Callers are expected to drop the
-    /// `ValueGuardMut` eagerly to avoid blocking other users, such as by taking a clone of the value.
-    pub fn find_mut(self: Pin<&mut Self>, index: usize) -> Option<(usize, ValueGuardMut<'_, T>)> {
-        // SAFETY: `self.xa` is always valid by the type invariant.
-        unsafe { bindings::xa_lock(self.xa.get()) };
-
-        // SAFETY: `self.xa` is always valid by the type invariant.
-        let guard = ScopeGuard::new(|| unsafe { bindings::xa_unlock(self.xa.get()) });
-
-        let indexp = &mut index.try_into().ok()?;
-        // SAFETY: `self.xa` is always valud by the type invariant.
-        unsafe {
-            bindings::xa_find(
-                self.xa.get(),
-                indexp,
-                core::ffi::c_ulong::MAX,
-                bindings::BINDINGS_XA_PRESENT,
-            )
-        };
-
-        let new_index = *indexp;
-
-        // SAFETY: `self.xa` is always valid by the type invariant.
-        let p = unsafe { bindings::xa_load(self.xa.get(), new_index) };
-
-        let new_index: usize = new_index.try_into().ok()?;
-
-        match NonNull::new(p as *mut T) {
-            Some(p) => {
-                guard.dismiss();
-                Some((new_index, ValueGuardMut(p, self)))
-            }
-            None => None,
-        }
     }
 
     /// Removes and returns an entry, returning it if it existed.
@@ -360,76 +251,6 @@ impl<T: ForeignOwnable> XArray<T> {
         } else {
             Some(unsafe { T::from_foreign(p) })
         }
-    }
-
-    /// Allocates a new index in the array, optionally storing a new value into it, with
-    /// configurable bounds for the index range to allocate from.
-    ///
-    /// If `value` is `None`, then the index is reserved from further allocation but remains
-    /// free for storing a value into it.
-    fn alloc_limits_opt(self: Pin<&Self>, value: Option<T>, min: u32, max: u32) -> Result<usize> {
-        let new = value.map_or(core::ptr::null(), |a| a.into_foreign());
-        let mut id: u32 = 0;
-
-        // SAFETY: `self.xa` is always valid by the type invariant. If this succeeds, it
-        // takes ownership of the passed `T` (if any). If it fails, we must drop the
-        // `T` again.
-        let ret = unsafe {
-            bindings::xa_alloc(
-                self.xa.get(),
-                &mut id,
-                new as *mut _,
-                bindings::xa_limit { min, max },
-                bindings::GFP_KERNEL,
-            )
-        };
-
-        if ret < 0 {
-            // Make sure to drop the value we failed to store
-            if !new.is_null() {
-                // SAFETY: If `new` is not NULL, it came from the `ForeignOwnable` we got
-                // from the caller.
-                unsafe { T::from_foreign(new) };
-            }
-            Err(Error::from_errno(ret))
-        } else {
-            Ok(id as usize)
-        }
-    }
-
-    /// Allocates a new index in the array, storing a new value into it, with configurable
-    /// bounds for the index range to allocate from.
-    pub fn alloc_limits(self: Pin<&Self>, value: T, min: u32, max: u32) -> Result<usize> {
-        self.alloc_limits_opt(Some(value), min, max)
-    }
-
-    /// Allocates a new index in the array, storing a new value into it.
-    pub fn alloc(self: Pin<&Self>, value: T) -> Result<usize> {
-        self.alloc_limits(value, 0, u32::MAX)
-    }
-
-    /// Reserves a new index in the array within configurable bounds for the index.
-    ///
-    /// Returns a `Reservation` object, which can then be used to store a value at this index or
-    /// otherwise free it for reuse.
-    pub fn reserve_limits(self: Pin<&Self>, min: u32, max: u32) -> Result<Reservation<'_, T>> {
-        Ok(Reservation(
-            self,
-            self.alloc_limits_opt(None, min, max)?,
-            PhantomData,
-        ))
-    }
-
-    /// Reserves a new index in the array.
-    ///
-    /// Returns a `Reservation` object, which can then be used to store a value at this index or
-    /// otherwise free it for reuse.
-    pub fn reserve(self: Pin<&Self>) -> Result<Reservation<'_, T>> {
-        Ok(Reservation(
-            self,
-            self.alloc_limits_opt(None, 0, u32::MAX)?,
-            PhantomData,
-        ))
     }
 }
 

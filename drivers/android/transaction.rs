@@ -64,6 +64,7 @@ impl Transaction {
                 pr_warn!("Oneway transaction should not be in a transaction stack.");
                 return Err(EINVAL.into());
             }
+            alloc.set_info_oneway_node(node_ref.node.clone());
         }
         if trd.flags & TF_CLEAR_BUF != 0 {
             alloc.set_info_clear_on_drop();
@@ -166,8 +167,18 @@ impl Transaction {
     ///
     /// Not used for replies.
     pub(crate) fn submit(self: Arc<Self>) -> BinderResult {
+        let oneway = self.flags & TF_ONE_WAY != 0;
         let process = self.to.clone();
         let mut process_inner = process.inner.lock();
+
+        if oneway {
+            if let Some(target_node) = self.target_node.clone() {
+                target_node.submit_oneway(self, &mut process_inner)?;
+                return Ok(());
+            } else {
+                pr_err!("Failed to submit oneway transaction to node.");
+            }
+        }
 
         let res = if let Some(thread) = self.find_target_thread() {
             match thread.push_work(self) {

@@ -2,7 +2,7 @@
 
 use kernel::{
     io_buffer::IoBufferWriter,
-    linked_list::Links,
+    linked_list::{Links, List},
     prelude::*,
     sync::lock::{spinlock::SpinLockBackend, Guard},
     sync::{Arc, LockedBy},
@@ -11,9 +11,11 @@ use kernel::{
 
 use crate::{
     defs::*,
+    error::{BinderError, BinderResult},
     process::{Process, ProcessInner},
     thread::Thread,
-    DeliverToRead,
+    transaction::Transaction,
+    DeliverToRead, DeliverToReadListAdapter,
 };
 
 struct CountState {
@@ -36,6 +38,8 @@ impl CountState {
 struct NodeInner {
     strong: CountState,
     weak: CountState,
+    oneway_todo: List<DeliverToReadListAdapter>,
+    has_pending_oneway_todo: bool,
     /// The number of active BR_INCREFS or BR_ACQUIRE operations. (should be maximum two)
     ///
     /// If this is non-zero, then we postpone any BR_RELEASE or BR_DECREFS notifications until the
@@ -66,6 +70,8 @@ impl Node {
                 NodeInner {
                     strong: CountState::new(),
                     weak: CountState::new(),
+                    oneway_todo: List::new(),
+                    has_pending_oneway_todo: false,
                     active_inc_refs: 0,
                 },
             ),
@@ -187,6 +193,63 @@ impl Node {
         writer.write(&self.ptr)?;
         writer.write(&self.cookie)?;
         Ok(())
+    }
+
+    pub(crate) fn submit_oneway(
+        &self,
+        transaction: Arc<Transaction>,
+        guard: &mut Guard<'_, ProcessInner, SpinLockBackend>,
+    ) -> BinderResult {
+        if guard.is_dead {
+            return Err(BinderError::new_dead());
+        }
+
+        let inner = self.inner.access_mut(guard);
+        if inner.has_pending_oneway_todo {
+            inner.oneway_todo.push_back(transaction);
+        } else {
+            inner.has_pending_oneway_todo = true;
+            guard.push_work(transaction).map_err(|(err, _work)| err)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn release(&self, guard: &mut Guard<'_, ProcessInner, SpinLockBackend>) {
+        // Move every pending oneshot message to the process todolist. The process
+        // will cancel it later.
+        //
+        // New items can't be pushed after this call, since `submit_oneway` fails when the process
+        // is dead, which is set before `Node::release` is called.
+        //
+        // TODO: Give our linked list implementation the ability to move everything in one go.
+        while let Some(work) = self.inner.access_mut(guard).oneway_todo.pop_front() {
+            guard.push_work_for_release(work);
+        }
+    }
+
+    pub(crate) fn pending_oneway_finished(&self) {
+        let mut guard = self.owner.inner.lock();
+        if guard.is_dead {
+            // Cleanup will happen in `Process::deferred_release`.
+            return;
+        }
+
+        let inner = self.inner.access_mut(&mut guard);
+
+        let transaction = inner.oneway_todo.pop_front();
+        inner.has_pending_oneway_todo = transaction.is_some();
+        if let Some(transaction) = transaction {
+            match guard.push_work(transaction) {
+                Ok(()) => {}
+                Err((_err, work)) => {
+                    // Process is dead.
+                    // This shouldn't happen due to the `is_dead` check, but if it does, just put
+                    // the work item back into the list. Process cleanup will take care of it.
+                    let inner = self.inner.access_mut(&mut guard);
+                    inner.oneway_todo.push_back(work);
+                }
+            }
+        }
     }
 }
 

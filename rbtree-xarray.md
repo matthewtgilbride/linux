@@ -1,4 +1,4 @@
-Subject: Migrating from RBTree to XArray in Binder
+Subject: Migrating from `RBTree` to `XArray` in Binder
 
 # Background
 Hello,
@@ -7,16 +7,16 @@ I'm working on a project to rewrite Android's
 [binder driver](https://github.com/torvalds/linux/tree/master/drivers/android) in rust.
 Recently we addressed some TODOs around worst-case performance by
 [using red-black trees instead of a linked list](https://android-review.googlesource.com/c/kernel/common/+/2567935).
-We've since learned that the upstream RBTree data structure is deprecated.  Our understanding is that RBTree should
-never be used for any new code, and we should use the XArray data structure instead.
+We've since learned that the upstream `RBTree` data structure is deprecated.  Our understanding is that `RBTree` should
+never be used for any new code, and we should use the `XArray` data structure instead.
 
-XArray should be fine for all of our use cases in binder except one - the "range allocator".
-We're not sure what to do for this particular use case, and are looking for guidance.  [The C driver uses
+`XArray` should be fine for all of our use cases in binder except one - the "range allocator".
+We're not sure what to do for this particular case, and are looking for guidance.  [The C driver uses
 RBTree](https://github.com/torvalds/linux/blob/3f01e9fed8454dcd89727016c3e5b2fbb8f8e50c/drivers/android/binder_alloc.h#L83-L85), 
 which led us down that path in the first place.
 
 ## TLDR
-**How should we use XArray (or some other data structure that is not deprecated) to address the following scenario?**
+**How should we use `XArray` (or some other data structure that is not deprecated) to address the following scenario?**
 
 # Range Allocator
 Range allocator stores collection of "Descriptors":
@@ -35,7 +35,7 @@ We need to look descriptors up one of two ways:
 2. Find the *smallest* descriptor with a state of `Free` and a `size` greater than or equal to a given `size`.  Multiple descriptors can have the same size.
 
 ## Merging
-The other nuance is that neighboring descriptors should never *both* be in a state of `Free`.
+The other nuance is that neighboring descriptors (based on their `offset`) should never *both* be in a state of `Free`.
 When a descriptor transitions to this state, we check it's neighbors, and merge them together accordingly, e.g.:
 
 `(Reserved, Free, Reserved) -> (Reserved, Free, Free) -> (Reserved, Free)` (2nd and 3rd entries merged)
@@ -77,7 +77,8 @@ struct RangeAllocator<T> {
 }
 ```
 
-TODO: darksonn - help me explain why this one won't work.  We'd have 3 layrs of indirection here which, I guess, is the problem.
+TODO: Get help explaining why this is bad.  I guess We'd have 3 layers of pointers to an integer which I guess is inefficient? I
+I'm also not sure how awkward traversing/modifying a list behind those 3 pointers will be.
 
 ## Option 2: Add `prev_same_size` and `next_same_size` to `Descriptor<T>`
 ```

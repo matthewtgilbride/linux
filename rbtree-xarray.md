@@ -10,11 +10,13 @@ Recently we addressed some TODOs around worst-case performance by
 We've since learned that the upstream RBTree data structure is deprecated.  Our understanding is that RBTree should
 never be used for any new code, and we should use the XArray data structure instead.
 
-XArray should be fine for all of our use cases in binder except one - the "range allocator" (range_alloc.rs).
-We're not sure what to do for this particular use case, and are looking for guidance.  The C driver uses
-RBTree here, which led us down that path in the first place.
+XArray should be fine for all of our use cases in binder except one - the "range allocator".
+We're not sure what to do for this particular use case, and are looking for guidance.  [The C driver uses
+RBTree](https://github.com/torvalds/linux/blob/3f01e9fed8454dcd89727016c3e5b2fbb8f8e50c/drivers/android/binder_alloc.h#L83-L85), 
+which led us down that path in the first place.
 
-How should we use XArray (or some other data structure that is not deprecated) to address the following scenario?
+## TLDR
+**How should we use XArray (or some other data structure that is not deprecated) to address the following scenario?**
 
 # Range Allocator
 Range allocator stores collection of "Descriptors":

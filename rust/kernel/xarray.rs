@@ -7,12 +7,13 @@
 use crate::{
     bindings,
     error::{Error, Result},
+    prelude::*,
     types::{ForeignOwnable, Opaque, ScopeGuard},
 };
 use core::{
     marker::{PhantomData, PhantomPinned},
     pin::Pin,
-    ptr::NonNull,
+    ptr::{addr_of_mut, NonNull},
 };
 
 /// Flags passed to `XArray::new` to configure the `XArray`.
@@ -50,14 +51,18 @@ pub mod flags {
 /// rudimentary read/write operations.
 ///
 /// ```
+/// use core::{
+///     borrow::Borrow,
+///     ops::{ Deref, DerefMut }
+/// };
 /// use kernel::{
+///     pin_init,
 ///     sync::Arc,
-///     xarray::{XArray, flags::LOCK_IRQ}
+///     xarray::{ XArray, flags::LOCK_IRQ }
 /// };
 ///
-/// let xarr: Box<XArray<Arc<usize>>> = Box::try_new(XArray::new(LOCK_IRQ))?;
-/// let xarr: Pin<Box<XArray<Arc<usize>>>> = Box::into_pin(xarr);
-/// let xarr: Pin<&XArray<Arc<usize>>> = xarr.as_ref();
+/// let xarr = Box::pin_init(XArray::<Arc<usize>>::new(LOCK_IRQ)).unwrap();
+/// let xarr = xarr.as_ref();
 ///
 /// // `get` and `set` are used to read/write values.
 /// assert!(xarr.get(0).is_none());
@@ -82,7 +87,7 @@ pub mod flags {
 /// ```
 ///
 /// In this example, we create a new `XArray` and demonstrate
-/// reading values that are not `Clone`, as well as mutating values.
+/// reading and/or mutating values that are not `T::Borrowed<'a>: Into<T>`.
 ///
 /// ```
 /// use core::{
@@ -91,30 +96,23 @@ pub mod flags {
 /// };
 /// use kernel::xarray::{XArray, flags::LOCK_IRQ};
 ///
-/// let xarr: Box<XArray<Box<usize>>> = Box::try_new(XArray::new(LOCK_IRQ))?;
-/// let mut xarr: Pin<Box<XArray<Box<usize>>>> = Box::into_pin(xarr);
+/// let xarr = Box::pin_init(XArray::<Box<usize>>::new(LOCK_IRQ)).unwrap();
+/// let xarr = xarr.as_ref();
 ///
-/// // Create scopes so that references can be dropped
-/// // in order to take a new, mutable/immutable ones afterwards.
-/// {
-///   let xarr: Pin<&XArray<Box<usize>>> = xarr.as_ref();
-///   // If the type is not `Clone`, use `get_shared` to access a shared reference
-///   // from a closure.
-///   assert!(xarr.get_shared(0, |x| x.is_none()));
-///   xarr.set(0, Box::try_new(0)?);
-///   xarr.get_shared(0, |x| assert_eq!(*x.unwrap(), 0));
-/// }
-/// {
-///   let mut xarr = xarr.as_mut();
-///   let mut value = xarr.get_mutable(0).unwrap();
-///   let mut value = value.deref_mut().as_mut();
-///   assert_eq!(value, &mut 0);
-///   *value = 1;
-/// }
-/// {
-///   let xarr = xarr.as_ref();
-///   xarr.get_shared(0, |x| assert_eq!(*x.unwrap(), 1));
-/// }
+/// // If the type is not `T::Borrowed<'a>: Into<T>`, use `get_scoped` to access a shared reference
+/// // from a closure.
+/// assert!(xarr.get_scoped(0, |x| x.is_none()));
+/// xarr.set(0, Box::try_new(0)?);
+/// xarr.get_scoped(0, |x| assert_eq!(*x.unwrap(), 0));
+///
+/// // `get_scoped` also gives mutable access inside the closure.
+/// xarr.get_scoped(0, |x| {
+///     let mut_x = x.unwrap();
+///     assert_eq!(mut_x, &0);
+///     *mut_x = 1;
+/// });
+///
+/// xarr.get_scoped(0, |x| assert_eq!(*x.unwrap(), 1));
 ///
 /// # Ok::<(), Error>(())
 /// ```
@@ -127,39 +125,28 @@ pub struct XArray<T: ForeignOwnable> {
 
 impl<T: ForeignOwnable> XArray<T> {
     /// Creates a new `XArray` with the given flags.
-    pub fn new(flags: Flags) -> XArray<T> {
-        let xa = Opaque::uninit();
-
-        // SAFETY: We have just created `xa`. This data structure does not require
-        // pinning.
-        unsafe { bindings::xa_init_flags(xa.get(), flags) };
-
-        // INVARIANT: Initialize the `XArray` with a valid `xa`.
-        XArray {
-            xa,
-            _p: PhantomData,
-            _q: PhantomPinned,
+    pub fn new(flags: Flags) -> impl PinInit<Self> {
+        unsafe {
+            kernel::init::pin_init_from_closure(move |slot: *mut XArray<T>| {
+                bindings::xa_init_flags(Opaque::raw_get(addr_of_mut!((*slot).xa)), flags);
+                Ok(())
+            })
         }
     }
 
     /// Replaces an entry with a new value, returning the old value (if any).
-    pub fn replace(self: Pin<&Self>, index: usize, value: T) -> Result<Option<T>> {
+    pub fn replace(&self, index: u64, value: T) -> Result<Option<T>> {
         let new = value.into_foreign();
         // SAFETY: `new` just came from into_foreign(), and we dismiss this guard if
         // the xa_store operation succeeds and takes ownership of the pointer.
         let guard = ScopeGuard::new(|| unsafe {
-            T::from_foreign(new);
+            drop(T::from_foreign(new));
         });
 
         // SAFETY: `self.xa` is always valid by the type invariant, and we are storing
         // a `T::into_foreign()` result which upholds the later invariants.
         let old = unsafe {
-            bindings::xa_store(
-                self.xa.get(),
-                index.try_into()?,
-                new as *mut _,
-                bindings::GFP_KERNEL,
-            )
+            bindings::xa_store(self.xa.get(), index, new as *mut _, bindings::GFP_KERNEL)
         };
 
         let ret = unsafe { bindings::xa_err(old) };
@@ -178,7 +165,7 @@ impl<T: ForeignOwnable> XArray<T> {
     }
 
     /// Replaces an entry with a new value, dropping the old value (if any).
-    pub fn set(self: Pin<&Self>, index: usize, value: T) -> Result {
+    pub fn set(&self, index: u64, value: T) -> Result {
         self.replace(index, value)?;
         Ok(())
     }
@@ -186,39 +173,28 @@ impl<T: ForeignOwnable> XArray<T> {
     /// Looks up a reference to an entry in the array, cloning it
     /// and returning the cloned value to the user.
     ///
-    pub fn get(self: Pin<&Self>, index: u64) -> Option<T::Borrowed<'_>>
+    pub fn get(&self, index: u64) -> Option<T>
     where
-        T: Clone,
+        for<'a> T::BorrowedMut<'a>: Into<T>,
     {
-        // SAFETY: `self.xa` is always valid by the type invariant.
-        unsafe { bindings::xa_lock(self.xa.get()) };
-
-        // SAFETY: `self.xa` is always valid by the type invariant.
-        let p = unsafe { bindings::xa_load(self.xa.get(), index) } as *const T;
-
-        let t = NonNull::new(p as *mut T).map(|p| unsafe { T::borrow(p.clone().as_ptr() as _) });
-
-        // SAFETY: `self.xa` is always valid by the type invariant.
-        unsafe { bindings::xa_unlock(self.xa.get()) };
-
-        t
+        self.get_scoped(index, |x| x.map(|v| v.into()))
     }
 
     /// Looks up and a reference to an entry in the array, calling the user
     /// provided function on the resulting `Option<&T>` to return a value
-    /// computed from the reference. Use this function if you need shared
-    /// access to a `&T` that is not `Clone`.
+    /// computed from the reference. Use this function if you need
+    /// (possibly mutable) access to a `&T` that is not `T::Borrowed<'a>: Into<T>`.
     ///
-    pub fn get_shared<F, R>(self: Pin<&Self>, index: u64, f: F) -> R
+    pub fn get_scoped<F, R>(&self, index: u64, f: F) -> R
     where
-        F: FnOnce(Option<T::Borrowed<'_>>) -> R,
+        F: FnOnce(Option<T::BorrowedMut<'_>>) -> R,
     {
         // SAFETY: `self.xa` is always valid by the type invariant.
         unsafe { bindings::xa_lock(self.xa.get()) };
 
         // SAFETY: `self.xa` is always valid by the type invariant.
         let p = unsafe { bindings::xa_load(self.xa.get(), index) };
-        let t = NonNull::new(p as *mut T).map(|p| unsafe { T::borrow(p.as_ptr() as _) });
+        let t = NonNull::new(p as *mut T).map(|p| unsafe { T::borrow_mut(p.as_ptr() as _) });
         let r = f(t);
 
         // SAFETY: `self.xa` is always valid by the type invariant.
@@ -227,25 +203,9 @@ impl<T: ForeignOwnable> XArray<T> {
         r
     }
 
-    /// Looks up and returns a *mutable* reference to an entry in the array.
-    pub fn get_mutable(self: Pin<&mut Self>, index: u64) -> Option<ScopeGuard<T, fn(T)>> {
-        // SAFETY: `self.xa` is always valid by the type invariant.
-        unsafe { bindings::xa_lock(self.xa.get()) };
-
-        // SAFETY: `self.xa` is always valid by the type invariant.
-        let p = unsafe { bindings::xa_load(self.xa.get(), index) };
-
-        let t = NonNull::new(p as *mut T).map(|p| unsafe { T::borrow_mut(p.as_ptr() as _) });
-
-        // SAFETY: `self.xa` is always valid by the type invariant.
-        unsafe { bindings::xa_unlock(self.xa.get()) };
-
-        t
-    }
-
     /// Removes and returns an entry, returning it if it existed.
-    pub fn remove(self: Pin<&Self>, index: usize) -> Option<T> {
-        let p = unsafe { bindings::xa_erase(self.xa.get(), index.try_into().ok()?) };
+    pub fn remove(&self, index: u64) -> Option<T> {
+        let p = unsafe { bindings::xa_erase(self.xa.get(), index) };
         if p.is_null() {
             None
         } else {

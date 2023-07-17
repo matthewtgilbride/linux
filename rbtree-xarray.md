@@ -7,13 +7,26 @@ I'm working on a project to rewrite Android's
 [binder driver](https://github.com/torvalds/linux/tree/master/drivers/android) in rust.
 Recently we addressed some TODOs around worst-case performance by
 [using red-black trees instead of a linked list](https://android-review.googlesource.com/c/kernel/common/+/2567935).
+A rudimentary benchmark showed that worst case performance of the related code was better in practice:
+
+| Duration (μs)| RBTree    | LinkedList |
+| ------------ | --------- | ---------- |
+| 0-9,999      | 8,076,424 | 7,533,262  |
+| 10k-20k      | 40        | 520        |
+| 20k-30k      | 7         | 49         |
+| 30k-40k      | 2         | 9          |
+| 40k-50k      | 0         | 1          |
+| 50k-60k      | 0         | 0          |
+| 60k-         | 1         | 0          |
+| Total        | 8,076,474 | 7,533,841  |
+
 We've since learned that the upstream `RBTree` data structure is deprecated.  Our understanding is that `RBTree` should
 never be used for any new code, and we should use the `XArray` data structure instead.
 
-`XArray` should be fine for all of our use cases in binder except one - the "range allocator".
-We're not sure what to do for this particular case, and are looking for guidance.  [The C driver uses
+`XArray` should be fine for all of our use cases in binder except this one - the "range allocator".
+We're not sure what to do here, and are looking for guidance.  [The C driver uses
 RBTree](https://github.com/torvalds/linux/blob/3f01e9fed8454dcd89727016c3e5b2fbb8f8e50c/drivers/android/binder_alloc.h#L83-L85), 
-which led us down that path in the first place.
+which led us down this path in the first place.
 
 ## TLDR
 **How should we use `XArray` (or some other data structure that is not deprecated) to address the following scenario?**
@@ -72,13 +85,15 @@ integer keys, we see the following options:
 ## Option 1: Use XArray<Box<LinkedList<usize>>>
 ```
 struct RangeAllocator<T> {
+    // all descriptors by offset
     descriptors: XArray<Box<Descriptor<T>>>,
-    free_indices: XArray<Box<LinkedList<usize>>>
+    // free descriptors by size
+    free_offsets: XArray<Box<LinkedList<usize>>>
 }
 ```
 
-TODO: Get help explaining why this is bad.  I guess We'd have 3 layers of pointers to an integer which I guess is inefficient? I
-I'm also not sure how awkward traversing/modifying a list behind those 3 pointers will be.
+TODO: Get help explaining why this is bad.  I guess We'd have 3 layers of pointers to an integer which is inefficient? I
+I'm also not sure how awkward iterating/modifying a list behind those wrappers will be.
 
 ## Option 2: Add `prev_same_size` and `next_same_size` to `Descriptor<T>`
 ```

@@ -48,6 +48,7 @@ pub(crate) struct Allocation {
     pub(crate) process: Arc<Process>,
     allocation_info: Option<AllocationInfo>,
     free_on_drop: bool,
+    pub(crate) oneway_spam_detected: bool,
 }
 
 impl Allocation {
@@ -57,6 +58,7 @@ impl Allocation {
         size: usize,
         ptr: usize,
         pages: Arc<Vec<Pages<0>>>,
+        oneway_spam_detected: bool,
     ) -> Self {
         Self {
             process,
@@ -64,6 +66,7 @@ impl Allocation {
             size,
             ptr,
             pages,
+            oneway_spam_detected,
             allocation_info: None,
             free_on_drop: true,
         }

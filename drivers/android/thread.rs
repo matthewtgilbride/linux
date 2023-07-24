@@ -437,6 +437,10 @@ impl Thread {
         self.inner.lock().current_transaction = Some(transaction);
     }
 
+    pub(crate) fn has_current_transaction(&self) -> bool {
+        self.inner.lock().current_transaction.is_some()
+    }
+
     /// Attempts to fetch a work item from the thread-local queue. The behaviour if the queue is
     /// empty depends on `wait`: if it is true, the function waits for some work to be queued (or a
     /// signal); otherwise it returns indicating that none is available.
@@ -1022,6 +1026,10 @@ impl Thread {
         reply: Either<Arc<Transaction>, u32>,
         transaction: &Arc<Transaction>,
     ) -> bool {
+        if let Either::Left(transaction) = &reply {
+            transaction.set_outstanding(&mut *self.process.inner.lock());
+        }
+
         {
             let mut inner = self.inner.lock();
             if !inner.pop_transaction_replied(transaction) {

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 
+use core::sync::atomic::{AtomicBool, Ordering};
 use kernel::{
     io_buffer::IoBufferWriter,
     linked_list::Links,
@@ -15,13 +16,13 @@ use crate::{
     defs::*,
     error::{BinderError, BinderResult},
     node::{Node, NodeRef},
-    process::Process,
+    process::{Process, ProcessInner},
     ptr_align,
     thread::{PushWorkRes, Thread},
     DeliverToRead,
 };
 
-#[pin_data]
+#[pin_data(PinnedDrop)]
 pub(crate) struct Transaction {
     target_node: Option<Arc<Node>>,
     stack_next: Option<Arc<Transaction>>,
@@ -29,6 +30,7 @@ pub(crate) struct Transaction {
     to: Arc<Process>,
     #[pin]
     allocation: SpinLock<Option<Allocation>>,
+    is_outstanding: AtomicBool,
     code: u32,
     pub(crate) flags: u32,
     data_size: usize,
@@ -92,6 +94,7 @@ impl Transaction {
             data_address,
             links: Links::new(),
             allocation <- kernel::new_spinlock!(Some(alloc), "Transaction::new"),
+            is_outstanding: AtomicBool::new(false),
             txn_security_ctx_off,
         }))?)
     }
@@ -126,6 +129,7 @@ impl Transaction {
             data_address: alloc.ptr,
             links: Links::new(),
             allocation <- kernel::new_spinlock!(Some(alloc), "Transaction::new"),
+            is_outstanding: AtomicBool::new(false),
             txn_security_ctx_off: None,
         }))?)
     }
@@ -171,6 +175,26 @@ impl Transaction {
         None
     }
 
+    pub(crate) fn set_outstanding(&self, to_process: &mut ProcessInner) {
+        // No race because this method is only called once.
+        if !self.is_outstanding.load(Ordering::Relaxed) {
+            self.is_outstanding.store(true, Ordering::Relaxed);
+            to_process.add_outstanding_txn();
+        }
+    }
+
+    /// Decrement `outstanding_txns` in `to` if it hasn't already been decremented.
+    fn drop_outstanding_txn(&self) {
+        // No race because this is called at most twice, and one of the calls are in the
+        // destructor, which is guaranteed to not race with any other operations on the
+        // transaction. It also cannot race with `set_outstanding`, since submission happens
+        // before delivery.
+        if self.is_outstanding.load(Ordering::Relaxed) {
+            self.is_outstanding.store(false, Ordering::Relaxed);
+            self.to.drop_outstanding_txn();
+        }
+    }
+
     /// Submits the transaction to a work queue. Uses a thread if there is one in the transaction
     /// stack, otherwise uses the destination process.
     ///
@@ -180,13 +204,23 @@ impl Transaction {
         let process = self.to.clone();
         let mut process_inner = process.inner.lock();
 
+        self.set_outstanding(&mut *process_inner);
+
         if oneway {
             if let Some(target_node) = self.target_node.clone() {
+                if process_inner.is_frozen {
+                    process_inner.async_recv = true;
+                }
                 target_node.submit_oneway(self, &mut process_inner)?;
                 return Ok(());
             } else {
                 pr_err!("Failed to submit oneway transaction to node.");
             }
+        }
+
+        if process_inner.is_frozen {
+            process_inner.sync_recv = true;
+            return Err(BinderError::new_frozen());
         }
 
         let res = if let Some(thread) = self.find_target_thread() {
@@ -234,6 +268,7 @@ impl DeliverToRead for Transaction {
                 let reply = Either::Right(BR_FAILED_REPLY);
                 self.from.deliver_reply(reply, &self);
             }
+            self.drop_outstanding_txn();
         });
         let files = if let Ok(list) = self.prepare_file_list() {
             list
@@ -296,6 +331,8 @@ impl DeliverToRead for Transaction {
         // It is now the user's responsibility to clear the allocation.
         alloc.keep_alive();
 
+        self.drop_outstanding_txn();
+
         // When this is not a reply and not a oneway transaction, update `current_transaction`. If
         // it's a reply, `current_transaction` has already been updated appropriately.
         if self.target_node.is_some() && tr_sec.transaction_data.flags & TF_ONE_WAY == 0 {
@@ -311,6 +348,8 @@ impl DeliverToRead for Transaction {
             let reply = Either::Right(BR_DEAD_REPLY);
             self.from.deliver_reply(reply, &self);
         }
+
+        self.drop_outstanding_txn();
     }
 
     fn get_links(&self) -> &Links<dyn DeliverToRead> {
@@ -319,5 +358,12 @@ impl DeliverToRead for Transaction {
 
     fn should_sync_wakeup(&self) -> bool {
         self.flags & TF_ONE_WAY == 0
+    }
+}
+
+#[pinned_drop]
+impl PinnedDrop for Transaction {
+    fn drop(self: Pin<&mut Self>) {
+        self.drop_outstanding_txn();
     }
 }

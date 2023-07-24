@@ -69,6 +69,31 @@ pub(crate) struct ContextList {
     list: List<Arc<Context>>,
 }
 
+pub(crate) fn get_all_contexts() -> Result<Vec<Arc<Context>>> {
+    let mut lock = CONTEXTS.lock();
+
+    let count = {
+        let mut count = 0;
+        let mut cursor = lock.list.cursor_front();
+        while cursor.current().is_some() {
+            count += 1;
+            cursor.move_next();
+        }
+        count
+    };
+
+    // TODO: The current cursor API gives me a `&Context` rather than a `&Arc<Context>`, so I
+    // can't call clone to get a `Arc<Context>` via a cursor.
+    let mut ctxs = Vec::try_with_capacity(count)?;
+    while let Some(cur) = lock.list.pop_front() {
+        ctxs.try_push(cur)?;
+    }
+    for ctx in &ctxs {
+        lock.list.push_back(ctx.clone());
+    }
+    Ok(ctxs)
+}
+
 /// This struct keeps track of the processes using this context, and which process is the context
 /// manager.
 struct Manager {
@@ -175,5 +200,51 @@ impl Context {
             .ok_or_else(BinderError::new_dead)?
             .clone(strong)
             .map_err(BinderError::from)
+    }
+
+    pub(crate) fn for_each_proc<F>(&self, mut func: F)
+    where
+        F: FnMut(&Process),
+    {
+        let lock = self.manager.lock();
+        let mut cursor = lock.all_procs.cursor_front();
+        while let Some(proc) = cursor.current() {
+            func(proc);
+            cursor.move_next();
+        }
+    }
+
+    pub(crate) fn get_all_procs(&self) -> Result<Vec<Arc<Process>>> {
+        let mut lock = self.manager.lock();
+
+        let count = {
+            let mut count = 0;
+            let mut cursor = lock.all_procs.cursor_front();
+            while cursor.current().is_some() {
+                count += 1;
+                cursor.move_next();
+            }
+            count
+        };
+
+        // TODO: The current cursor API gives me a `&Process` rather than a `&Arc<Process>`, so I
+        // can't call clone to get a `Arc<Process>` via a cursor.
+        //
+        // When the linked list is fixed, we can simplify this a lot.
+        let mut procs = Vec::try_with_capacity(count)?;
+        while let Some(cur) = lock.all_procs.pop_front() {
+            // This won't fail because we allocated enough capacity to hold all of them.
+            procs.try_push(cur)?;
+        }
+        for proc in &procs {
+            lock.all_procs.push_back(proc.clone());
+        }
+        Ok(procs)
+    }
+
+    pub(crate) fn get_procs_with_pid(&self, pid: i32) -> Result<Vec<Arc<Process>>> {
+        let mut procs = self.get_all_procs()?;
+        procs.retain(|proc| proc.task.pid() == pid);
+        Ok(procs)
     }
 }

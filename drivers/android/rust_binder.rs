@@ -8,6 +8,8 @@ use kernel::{
     io_buffer::IoBufferWriter,
     linked_list::{GetLinks, GetLinksWrapped, Links},
     prelude::*,
+    seq_file::SeqFile,
+    seq_print,
     sync::Arc,
     types::ForeignOwnable,
     user_ptr::UserSlicePtrWriter,
@@ -304,7 +306,13 @@ unsafe extern "C" fn rust_binder_stats_show(_: *mut seq_file) -> core::ffi::c_in
 }
 
 #[no_mangle]
-unsafe extern "C" fn rust_binder_state_show(_: *mut seq_file) -> core::ffi::c_int {
+unsafe extern "C" fn rust_binder_state_show(ptr: *mut seq_file) -> core::ffi::c_int {
+    // SAFETY: The caller ensures that the pointer is valid and exclusive for the duration in which
+    // this method is called.
+    let m = unsafe { SeqFile::from_raw(ptr) };
+    if let Err(err) = rust_binder_state_show_impl(m) {
+        seq_print!(m, "failed to generate state: {:?}\n", err);
+    }
     0
 }
 
@@ -316,4 +324,17 @@ unsafe extern "C" fn rust_binder_transactions_show(_: *mut seq_file) -> core::ff
 #[no_mangle]
 unsafe extern "C" fn rust_binder_transaction_log_show(_: *mut seq_file) -> core::ffi::c_int {
     0
+}
+
+fn rust_binder_state_show_impl(m: &mut SeqFile) -> Result<()> {
+    let contexts = context::get_all_contexts()?;
+    for ctx in contexts {
+        let procs = ctx.get_all_procs()?;
+        seq_print!(m, "context {}: ({} processes)\n", &*ctx.name, procs.len());
+        for proc in procs {
+            proc.debug_print(m)?;
+            seq_print!(m, "\n");
+        }
+    }
+    Ok(())
 }

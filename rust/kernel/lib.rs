@@ -49,6 +49,7 @@ pub mod print;
 pub mod raw_list;
 pub mod rbtree;
 pub mod security;
+pub mod seq_file;
 mod static_assert;
 #[doc(hidden)]
 pub mod std_vendor;

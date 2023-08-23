@@ -239,11 +239,11 @@ pid_t rust_helper_task_tgid_nr_ns(struct task_struct *tsk,
 }
 EXPORT_SYMBOL_GPL(rust_helper_task_tgid_nr_ns);
 
-struct kunit *rust_helper_kunit_get_current_test(void)
-{
-	return kunit_get_current_test();
-}
-EXPORT_SYMBOL_GPL(rust_helper_kunit_get_current_test);
+//struct kunit *rust_helper_kunit_get_current_test(void)
+//{
+//	return kunit_get_current_test();
+//}
+//EXPORT_SYMBOL_GPL(rust_helper_kunit_get_current_test);
 
 void rust_helper_init_work_with_key(struct work_struct *work, work_func_t func,
 				    bool onstack, const char *name,

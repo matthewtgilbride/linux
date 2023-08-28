@@ -146,6 +146,13 @@ struct kunit *rust_helper_kunit_get_current_test(void)
 }
 EXPORT_SYMBOL_GPL(rust_helper_kunit_get_current_test);
 
+void rust_helper_rb_link_node(struct rb_node *node, struct rb_node *parent,
+			      struct rb_node **rb_link)
+{
+	rb_link_node(node, parent, rb_link);
+}
+EXPORT_SYMBOL_GPL(rust_helper_rb_link_node);
+
 void rust_helper_xa_init_flags(struct xarray *xa, gfp_t flags)
 {
 	xa_init_flags(xa, flags);

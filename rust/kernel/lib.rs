@@ -39,6 +39,8 @@ pub mod ioctl;
 pub mod kunit;
 pub mod prelude;
 pub mod print;
+pub mod range_alloc;
+pub mod rbtree;
 mod static_assert;
 #[doc(hidden)]
 pub mod std_vendor;

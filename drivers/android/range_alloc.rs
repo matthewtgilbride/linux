@@ -41,6 +41,26 @@ impl DescriptorState {
     }
 }
 
+const PAGE_SIZE: usize = kernel::bindings::PAGE_SIZE as usize;
+
+/// Represents a range of pages that have just become completely free.
+#[derive(Copy, Clone)]
+pub(crate) struct FreedRange {
+    pub(crate) start_page_idx: usize,
+    pub(crate) end_page_idx: usize,
+}
+
+impl FreedRange {
+    fn interior_pages(offset: usize, size: usize) -> FreedRange {
+        FreedRange {
+            // Divide round up
+            start_page_idx: (offset + (PAGE_SIZE - 1)) / PAGE_SIZE,
+            // Divide round down
+            end_page_idx: (offset + size) / PAGE_SIZE,
+        }
+    }
+}
+
 impl<T> RangeAllocator<T> {
     pub(crate) fn new(size: usize) -> Result<Self> {
         let desc = Box::try_new(Descriptor::new(0, size))?;
@@ -128,7 +148,12 @@ impl<T> RangeAllocator<T> {
     /// Free the provided allocation, then merge adjacent free regions if necessary.
     ///
     /// Returns how much to increase `free_oneway_space` by.
-    fn free_with_cursor(cursor: &mut CursorMut<'_, Box<Descriptor<T>>>) -> Result<usize> {
+    fn free_with_cursor(
+        cursor: &mut CursorMut<'_, Box<Descriptor<T>>>,
+    ) -> Result<(usize, FreedRange)> {
+        let mut freed_range;
+        let add_next_page_needed;
+        let add_prev_page_needed;
         let (mut size, is_oneway) = match cursor.current() {
             None => return Err(EINVAL),
             Some(ref mut entry) => {
@@ -138,13 +163,33 @@ impl<T> RangeAllocator<T> {
                     DescriptorState::Reserved { is_oneway, .. } => is_oneway,
                 };
                 entry.state = DescriptorState::Free;
+
+                freed_range = FreedRange::interior_pages(entry.offset, entry.size);
+                // Compute how large the next free region needs to be to include one more page in
+                // the newly freed range.
+                add_next_page_needed = match (entry.offset + entry.size) % PAGE_SIZE {
+                    0 => usize::MAX,
+                    unalign => PAGE_SIZE - unalign,
+                };
+                // Compute how large the previous free region needs to be to include one more page
+                // in the newly freed range.
+                add_prev_page_needed = match entry.offset % PAGE_SIZE {
+                    0 => usize::MAX,
+                    unalign => unalign,
+                };
+
                 (entry.size, is_oneway)
             }
         };
+
         let free_oneway_space_add = if is_oneway { size } else { 0 };
         // Try to merge with the next entry.
         if let Some(next) = cursor.peek_next() {
             if next.state == DescriptorState::Free {
+                if next.size >= add_next_page_needed {
+                    freed_range.end_page_idx += 1;
+                }
+
                 next.offset -= size;
                 next.size += size;
                 size = next.size;
@@ -154,11 +199,15 @@ impl<T> RangeAllocator<T> {
         // Try to merge with the previous entry.
         if let Some(prev) = cursor.peek_prev() {
             if prev.state == DescriptorState::Free {
+                if prev.size >= add_prev_page_needed {
+                    freed_range.start_page_idx -= 1;
+                }
+
                 prev.size += size;
                 cursor.remove_current();
             }
         }
-        Ok(free_oneway_space_add)
+        Ok((free_oneway_space_add, freed_range))
     }
 
     fn find_at_offset(&mut self, offset: usize) -> Option<CursorMut<'_, Box<Descriptor<T>>>> {
@@ -175,11 +224,11 @@ impl<T> RangeAllocator<T> {
         None
     }
 
-    pub(crate) fn reservation_abort(&mut self, offset: usize) -> Result {
+    pub(crate) fn reservation_abort(&mut self, offset: usize) -> Result<FreedRange> {
         let mut cursor = self.find_at_offset(offset).ok_or(EINVAL)?;
-        let free_oneway_space_add = Self::free_with_cursor(&mut cursor)?;
+        let (free_oneway_space_add, freed_range) = Self::free_with_cursor(&mut cursor)?;
         self.free_oneway_space += free_oneway_space_add;
-        Ok(())
+        Ok(freed_range)
     }
 
     pub(crate) fn reservation_commit(&mut self, offset: usize, data: Option<T>) -> Result {

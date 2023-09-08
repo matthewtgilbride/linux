@@ -41,10 +41,12 @@ pub mod io_buffer;
 pub mod ioctl;
 #[cfg(CONFIG_KUNIT)]
 pub mod kunit;
+pub mod linked_list;
 pub mod mm;
 pub mod pages;
 pub mod prelude;
 pub mod print;
+pub mod raw_list;
 pub mod rbtree;
 pub mod security;
 mod static_assert;

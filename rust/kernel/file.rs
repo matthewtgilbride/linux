@@ -284,6 +284,7 @@ impl DeferredFdCloser {
 
             // SAFETY: Getting a pointer to current is always safe.
             let current = unsafe { bindings::get_current() };
+            let current_files = unsafe { core::ptr::addr_of!((*current).files).read() };
             // SAFETY: The `file` pointer points at a valid file.
             unsafe { bindings::get_file(file) };
             // SAFETY: Due to the above `get_file`, even if the current task holds an `fdget` to
@@ -293,7 +294,7 @@ impl DeferredFdCloser {
             // to user space.
             //
             // Note: fl_owner_t is currently a void pointer.
-            unsafe { bindings::filp_close(file, current as bindings::fl_owner_t) };
+            unsafe { bindings::filp_close(file, current_files.cast()) };
             // SAFETY: The `inner` pointer is compatible with the `do_close_fd` method.
             //
             // The call to `task_work_add` can't fail, because we are scheduling the task work to

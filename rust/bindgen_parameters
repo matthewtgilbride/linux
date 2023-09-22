@@ -10,6 +10,9 @@
 --opaque-type x86_msi_data
 --opaque-type x86_msi_addr_lo
 
+--blocklist-function __list_add_valid_or_report
+--blocklist-function __list_del_entry_valid_or_report
+
 # `try` is a reserved keyword since Rust 2018; solved in `bindgen` v0.59.2,
 # commit 2aed6b021680 ("context: Escape the try keyword properly").
 --opaque-type kunit_try_catch

@@ -1215,9 +1215,17 @@ impl<T: ?Sized, A: Allocator> Box<T, A> {
 
 #[stable(feature = "rust1", since = "1.0.0")]
 unsafe impl<#[may_dangle] T: ?Sized, A: Allocator> Drop for Box<T, A> {
-    fn drop(&mut self) {
-        // FIXME: Do nothing, drop is currently performed by compiler.
-    }
+    #[inline]
+     fn drop(&mut self) {
+        // the T in the Box is dropped by the compiler before the destructor is run
+
+        let ptr = self.0;
+
+        unsafe {
+            let layout = Layout::for_value_raw(ptr.as_ptr());
+            self.1.deallocate(From::from(ptr.cast()), layout)
+        }
+     }
 }
 
 #[cfg(not(no_global_oom_handling))]

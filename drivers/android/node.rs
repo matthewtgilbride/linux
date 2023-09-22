@@ -13,7 +13,7 @@ use kernel::{
 
 use crate::{
     defs::*,
-    error::{BinderError, BinderResult},
+    error::BinderError,
     prio::{self, BinderPriority},
     process::{Process, ProcessInner},
     thread::Thread,
@@ -270,9 +270,9 @@ impl Node {
         &self,
         transaction: Arc<Transaction>,
         guard: &mut Guard<'_, ProcessInner, SpinLockBackend>,
-    ) -> BinderResult {
+    ) -> Result<(), (BinderError, Arc<dyn DeliverToRead>)> {
         if guard.is_dead {
-            return Err(BinderError::new_dead());
+            return Err((BinderError::new_dead(), transaction));
         }
 
         let inner = self.inner.access_mut(guard);
@@ -280,7 +280,7 @@ impl Node {
             inner.oneway_todo.push_back(transaction);
         } else {
             inner.has_pending_oneway_todo = true;
-            guard.push_work(transaction).map_err(|(err, _work)| err)?;
+            guard.push_work(transaction)?;
         }
         Ok(())
     }

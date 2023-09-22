@@ -274,8 +274,15 @@ impl Transaction {
                             target_node.take_outdated_transaction(&self, &mut process_inner);
                     }
                 }
-                target_node.submit_oneway(self, &mut process_inner)?;
-                return Ok(());
+                match target_node.submit_oneway(self, &mut process_inner) {
+                    Ok(()) => return Ok(()),
+                    Err((err, work)) => {
+                        drop(process_inner);
+                        // Drop work after releasing process lock.
+                        drop(work);
+                        return Err(err);
+                    },
+                }
             } else {
                 pr_err!("Failed to submit oneway transaction to node.");
             }

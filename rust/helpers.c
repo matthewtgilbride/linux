@@ -50,12 +50,50 @@ unsigned long rust_helper_copy_from_user(void *to, const void __user *from,
 }
 EXPORT_SYMBOL_GPL(rust_helper_copy_from_user);
 
+#define copy_from_user_constant(n)                                                \
+unsigned long rust_helper_copy_from_user_ ## n(void *to, const void __user *from) \
+{                                                                                 \
+	return copy_from_user(to, from, n);                                       \
+}                                                                                 \
+EXPORT_SYMBOL_GPL(rust_helper_copy_from_user_ ## n);
+
+copy_from_user_constant(4);
+copy_from_user_constant(8);
+copy_from_user_constant(12);
+copy_from_user_constant(16);
+copy_from_user_constant(24);
+copy_from_user_constant(32);
+copy_from_user_constant(40);
+copy_from_user_constant(48);
+copy_from_user_constant(56);
+copy_from_user_constant(64);
+copy_from_user_constant(128);
+
 unsigned long rust_helper_copy_to_user(void __user *to, const void *from,
 				       unsigned long n)
 {
 	return copy_to_user(to, from, n);
 }
 EXPORT_SYMBOL_GPL(rust_helper_copy_to_user);
+
+#define copy_to_user_constant(n)                                                \
+unsigned long rust_helper_copy_to_user_ ## n(void __user *to, const void *from) \
+{                                                                               \
+	return copy_to_user(to, from, n);                                       \
+}                                                                               \
+EXPORT_SYMBOL_GPL(rust_helper_copy_to_user_ ## n);
+
+copy_to_user_constant(4);
+copy_to_user_constant(8);
+copy_to_user_constant(12);
+copy_to_user_constant(16);
+copy_to_user_constant(24);
+copy_to_user_constant(32);
+copy_to_user_constant(40);
+copy_to_user_constant(48);
+copy_to_user_constant(56);
+copy_to_user_constant(64);
+copy_to_user_constant(128);
 
 unsigned long rust_helper_clear_user(void __user *to, unsigned long n)
 {

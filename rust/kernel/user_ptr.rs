@@ -8,9 +8,10 @@ use crate::{
     bindings,
     error::code::*,
     error::Result,
-    io_buffer::{IoBufferReader, IoBufferWriter},
+    io_buffer::{IoBufferReader, IoBufferWriter, ReadableFromBytes, WritableToBytes},
 };
 use alloc::vec::Vec;
+use core::mem::{size_of, MaybeUninit};
 
 /// A reference to an area in userspace memory, which can be either
 /// read-only or read-write.
@@ -144,6 +145,40 @@ impl IoBufferReader for UserSlicePtrReader {
         self.1 -= len;
         Ok(())
     }
+
+    fn read<T: ReadableFromBytes>(&mut self) -> Result<T> {
+        let mut out = MaybeUninit::<T>::uninit();
+        if size_of::<T>() > self.1 || size_of::<T>() > u32::MAX as usize {
+            return Err(EFAULT);
+        }
+        let out_ptr = out.as_mut_ptr();
+        // This matches on a compile time constant, so it will compile down to calling just one of
+        // them.
+        let res = match size_of::<T>() {
+            4 => unsafe { bindings::copy_from_user_4(out_ptr as _, self.0) },
+            8 => unsafe { bindings::copy_from_user_8(out_ptr as _, self.0) },
+            12 => unsafe { bindings::copy_from_user_12(out_ptr as _, self.0) },
+            16 => unsafe { bindings::copy_from_user_16(out_ptr as _, self.0) },
+            24 => unsafe { bindings::copy_from_user_24(out_ptr as _, self.0) },
+            32 => unsafe { bindings::copy_from_user_32(out_ptr as _, self.0) },
+            40 => unsafe { bindings::copy_from_user_40(out_ptr as _, self.0) },
+            48 => unsafe { bindings::copy_from_user_48(out_ptr as _, self.0) },
+            56 => unsafe { bindings::copy_from_user_56(out_ptr as _, self.0) },
+            64 => unsafe { bindings::copy_from_user_64(out_ptr as _, self.0) },
+            128 => unsafe { bindings::copy_from_user_128(out_ptr as _, self.0) },
+            len => unsafe { bindings::copy_from_user(out_ptr as _, self.0, len as _) },
+        };
+        if res != 0 {
+            return Err(EFAULT);
+        }
+        // Since this is not a pointer to a valid object in our program,
+        // we cannot use `add`, which has C-style rules for defined
+        // behavior.
+        self.0 = self.0.wrapping_add(size_of::<T>());
+        self.1 -= size_of::<T>();
+        // SAFETY: We just initialised the data.
+        Ok(unsafe { out.assume_init() })
+    }
 }
 
 /// A writer for [`UserSlicePtr`].
@@ -189,6 +224,41 @@ impl IoBufferWriter for UserSlicePtrWriter {
         // behavior.
         self.0 = self.0.wrapping_add(len);
         self.1 -= len;
+        Ok(())
+    }
+
+    /// Writes the contents of the given data into the io buffer.
+    fn write<T: WritableToBytes>(&mut self, data: &T) -> Result {
+        if size_of::<T>() > self.1 || size_of::<T>() > u32::MAX as usize {
+            return Err(EFAULT);
+        }
+
+        let data = data as *const T;
+
+        // This matches on a compile time constant, so it will compile down to calling just one of
+        // them.
+        let res = match size_of::<T>() {
+            4 => unsafe { bindings::copy_to_user_4(self.0, data as _) },
+            8 => unsafe { bindings::copy_to_user_8(self.0, data as _) },
+            12 => unsafe { bindings::copy_to_user_12(self.0, data as _) },
+            16 => unsafe { bindings::copy_to_user_16(self.0, data as _) },
+            24 => unsafe { bindings::copy_to_user_24(self.0, data as _) },
+            32 => unsafe { bindings::copy_to_user_32(self.0, data as _) },
+            40 => unsafe { bindings::copy_to_user_40(self.0, data as _) },
+            48 => unsafe { bindings::copy_to_user_48(self.0, data as _) },
+            56 => unsafe { bindings::copy_to_user_56(self.0, data as _) },
+            64 => unsafe { bindings::copy_to_user_64(self.0, data as _) },
+            128 => unsafe { bindings::copy_to_user_128(self.0, data as _) },
+            len => unsafe { bindings::copy_to_user(self.0, data as _, len as _) },
+        };
+        if res != 0 {
+            return Err(EFAULT);
+        }
+        // Since this is not a pointer to a valid object in our program,
+        // we cannot use `add`, which has C-style rules for defined
+        // behavior.
+        self.0 = self.0.wrapping_add(size_of::<T>());
+        self.1 -= size_of::<T>();
         Ok(())
     }
 }

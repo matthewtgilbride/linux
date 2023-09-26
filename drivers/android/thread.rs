@@ -1351,10 +1351,14 @@ impl Thread {
             BR_TRANSACTION_COMPLETE
         };
         let completion = Arc::try_new(DeliverCode::new(code))?;
-        self.inner.lock().push_work(completion);
-        // TODO: Remove the completion on error?
-        transaction.submit()?;
-        Ok(())
+        self.inner.lock().push_work(completion.clone());
+        match transaction.submit() {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                completion.skip();
+                Err(err)
+            },
+        }
     }
 
     fn write(self: &Arc<Self>, req: &mut BinderWriteRead) -> Result {

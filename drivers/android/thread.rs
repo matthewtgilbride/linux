@@ -28,7 +28,7 @@ use crate::{
     process::Process,
     ptr_align,
     transaction::Transaction,
-    DeliverCode, DeliverToRead, DeliverToReadListAdapter,
+    DeliverCode, DeliverToRead, DeliverToReadListAdapter, DArc, arc_try_new
 };
 
 use core::{
@@ -217,7 +217,7 @@ impl UnusedBufferSpace {
 pub(crate) enum PushWorkRes {
     Ok,
     AlreadyInList,
-    FailedDead(Arc<dyn DeliverToRead>),
+    FailedDead(DArc<dyn DeliverToRead>),
 }
 
 impl PushWorkRes {
@@ -244,18 +244,18 @@ struct InnerThread {
 
     /// Work item used to deliver error codes to the thread that started a transaction. Stored here
     /// so that it can be reused.
-    reply_work: Arc<ThreadError>,
+    reply_work: DArc<ThreadError>,
 
     /// Work item used to deliver error codes to the current thread. Stored here so that it can be
     /// reused.
-    return_work: Arc<ThreadError>,
+    return_work: DArc<ThreadError>,
 
     /// Determines whether the work list below should be processed. When set to false, `work_list`
     /// is treated as if it were empty.
     process_work_list: bool,
     /// List of work items to deliver to userspace.
     work_list: List<DeliverToReadListAdapter>,
-    current_transaction: Option<Arc<Transaction>>,
+    current_transaction: Option<DArc<Transaction>>,
 
     /// Extended error information for this thread.
     extended_error: ExtendedError,
@@ -281,15 +281,15 @@ impl InnerThread {
             looper_need_return: false,
             is_dead: false,
             process_work_list: false,
-            reply_work: Arc::try_new(ThreadError::new())?,
-            return_work: Arc::try_new(ThreadError::new())?,
+            reply_work: arc_try_new(ThreadError::new())?,
+            return_work: arc_try_new(ThreadError::new())?,
             work_list: List::new(),
             current_transaction: None,
             extended_error: ExtendedError::new(next_err_id(), BR_OK, 0),
         })
     }
 
-    fn pop_work(&mut self) -> Option<Arc<dyn DeliverToRead>> {
+    fn pop_work(&mut self) -> Option<DArc<dyn DeliverToRead>> {
         if !self.process_work_list {
             return None;
         }
@@ -299,7 +299,7 @@ impl InnerThread {
         ret
     }
 
-    fn push_work(&mut self, work: Arc<dyn DeliverToRead>) -> PushWorkRes {
+    fn push_work(&mut self, work: DArc<dyn DeliverToRead>) -> PushWorkRes {
         if self.is_dead {
             PushWorkRes::FailedDead(work)
         } else {
@@ -327,7 +327,7 @@ impl InnerThread {
 
     /// Used to push work items that do not need to be processed immediately and can wait until the
     /// thread gets another work item.
-    fn push_work_deferred(&mut self, work: Arc<dyn DeliverToRead>) {
+    fn push_work_deferred(&mut self, work: DArc<dyn DeliverToRead>) {
         self.work_list.push_back(work);
     }
 
@@ -336,7 +336,7 @@ impl InnerThread {
     /// previously-issued transaction to complete.
     ///
     /// The `thread` parameter should be the thread containing this `ThreadInner`.
-    fn pop_transaction_to_reply(&mut self, thread: &Thread) -> Result<Arc<Transaction>> {
+    fn pop_transaction_to_reply(&mut self, thread: &Thread) -> Result<DArc<Transaction>> {
         let transaction = self.current_transaction.take().ok_or(EINVAL)?;
         if core::ptr::eq(thread, transaction.from.as_ref()) {
             self.current_transaction = Some(transaction);
@@ -347,7 +347,7 @@ impl InnerThread {
         Ok(transaction)
     }
 
-    fn pop_transaction_replied(&mut self, transaction: &Arc<Transaction>) -> bool {
+    fn pop_transaction_replied(&mut self, transaction: &DArc<Transaction>) -> bool {
         match self.current_transaction.take() {
             None => false,
             Some(old) => {
@@ -518,7 +518,7 @@ impl Thread {
         Ok(())
     }
 
-    pub(crate) fn set_current_transaction(&self, transaction: Arc<Transaction>) {
+    pub(crate) fn set_current_transaction(&self, transaction: DArc<Transaction>) {
         self.inner.lock().current_transaction = Some(transaction);
     }
 
@@ -529,7 +529,7 @@ impl Thread {
     /// Attempts to fetch a work item from the thread-local queue. The behaviour if the queue is
     /// empty depends on `wait`: if it is true, the function waits for some work to be queued (or a
     /// signal); otherwise it returns indicating that none is available.
-    fn get_work_local(self: &Arc<Self>, wait: bool) -> Result<Option<Arc<dyn DeliverToRead>>> {
+    fn get_work_local(self: &Arc<Self>, wait: bool) -> Result<Option<DArc<dyn DeliverToRead>>> {
         {
             let mut inner = self.inner.lock();
             if inner.looper_need_return {
@@ -567,7 +567,7 @@ impl Thread {
     ///
     /// This must only be called when the thread is not participating in a transaction chain. If it
     /// is, the local version (`get_work_local`) should be used instead.
-    fn get_work(self: &Arc<Self>, wait: bool) -> Result<Option<Arc<dyn DeliverToRead>>> {
+    fn get_work(self: &Arc<Self>, wait: bool) -> Result<Option<DArc<dyn DeliverToRead>>> {
         // Try to get work from the thread's work queue, using only a local lock.
         {
             let mut inner = self.inner.lock();
@@ -628,7 +628,7 @@ impl Thread {
     ///
     /// Returns whether the item was successfully pushed. This can only fail if the work item is
     /// already in a work list.
-    pub(crate) fn push_work(&self, work: Arc<dyn DeliverToRead>) -> PushWorkRes {
+    pub(crate) fn push_work(&self, work: DArc<dyn DeliverToRead>) -> PushWorkRes {
         let sync = work.should_sync_wakeup();
 
         let res = self.inner.lock().push_work(work);
@@ -646,7 +646,7 @@ impl Thread {
 
     /// Attempts to push to given work item to the thread if it's a looper thread (i.e., if it's
     /// part of a thread pool) and is alive. Otherwise, push the work item to the process instead.
-    pub(crate) fn push_work_if_looper(&self, work: Arc<dyn DeliverToRead>) -> BinderResult {
+    pub(crate) fn push_work_if_looper(&self, work: DArc<dyn DeliverToRead>) -> BinderResult {
         let mut inner = self.inner.lock();
         if inner.is_looper() && !inner.is_dead {
             inner.push_work(work);
@@ -657,7 +657,7 @@ impl Thread {
         }
     }
 
-    pub(crate) fn push_work_deferred(&self, work: Arc<dyn DeliverToRead>) {
+    pub(crate) fn push_work_deferred(&self, work: DArc<dyn DeliverToRead>) {
         self.inner.lock().push_work_deferred(work);
     }
 
@@ -1179,8 +1179,8 @@ impl Thread {
 
     pub(crate) fn deliver_reply(
         &self,
-        reply: Either<Arc<Transaction>, u32>,
-        transaction: &Arc<Transaction>,
+        reply: Either<DArc<Transaction>, u32>,
+        transaction: &DArc<Transaction>,
     ) {
         if self.deliver_single_reply(reply, transaction) {
             transaction.from.unwind_transaction_stack();
@@ -1194,8 +1194,8 @@ impl Thread {
     /// transaction stack by completing transactions for threads that are dead.
     fn deliver_single_reply(
         &self,
-        reply: Either<Arc<Transaction>, u32>,
-        transaction: &Arc<Transaction>,
+        reply: Either<DArc<Transaction>, u32>,
+        transaction: &DArc<Transaction>,
     ) -> bool {
         if let Either::Left(transaction) = &reply {
             transaction.set_outstanding(&mut *self.process.inner.lock());
@@ -1225,7 +1225,7 @@ impl Thread {
     }
 
     /// Determines if the given transaction is the current transaction for this thread.
-    fn is_current_transaction(&self, transaction: &Arc<Transaction>) -> bool {
+    fn is_current_transaction(&self, transaction: &DArc<Transaction>) -> bool {
         let inner = self.inner.lock();
         match &inner.current_transaction {
             None => false,
@@ -1236,7 +1236,7 @@ impl Thread {
     /// Determines the current top of the transaction stack. It fails if the top is in another
     /// thread (i.e., this thread belongs to a stack but it has called another thread). The top is
     /// [`None`] if the thread is not currently participating in a transaction stack.
-    fn top_of_transaction_stack(&self) -> Result<Option<Arc<Transaction>>> {
+    fn top_of_transaction_stack(&self) -> Result<Option<DArc<Transaction>>> {
         let inner = self.inner.lock();
         if let Some(cur) = &inner.current_transaction {
             if core::ptr::eq(self, cur.from.as_ref()) {
@@ -1276,7 +1276,7 @@ impl Thread {
         // TODO: We need to ensure that there isn't a pending transaction in the work queue. How
         // could this happen?
         let top = self.top_of_transaction_stack()?;
-        let completion = Arc::try_new(DeliverCode::new(BR_TRANSACTION_COMPLETE))?;
+        let completion = crate::arc_try_new(DeliverCode::new(BR_TRANSACTION_COMPLETE))?;
         let transaction = Transaction::new(node_ref, top, self, tr)?;
 
         // Check that the transaction stack hasn't changed while the lock was released, then update
@@ -1312,7 +1312,7 @@ impl Thread {
 
         // We need to complete the transaction even if we cannot complete building the reply.
         let out = (|| -> BinderResult<_> {
-            let completion = Arc::try_new(DeliverCode::new(BR_TRANSACTION_COMPLETE))?;
+            let completion = crate::arc_try_new(DeliverCode::new(BR_TRANSACTION_COMPLETE))?;
             let process = orig.from.process.clone();
             let allow_fds = orig.flags & TF_ACCEPT_FDS != 0;
             let reply = Transaction::new_reply(self, process, tr, allow_fds)?;
@@ -1350,7 +1350,7 @@ impl Thread {
         } else {
             BR_TRANSACTION_COMPLETE
         };
-        let completion = Arc::try_new(DeliverCode::new(code))?;
+        let completion = crate::arc_try_new(DeliverCode::new(code))?;
         self.inner.lock().push_work(completion.clone());
         match transaction.submit() {
             Ok(()) => Ok(()),
@@ -1594,14 +1594,12 @@ impl GetLinks for Thread {
 
 struct ThreadError {
     error_code: AtomicU32,
-    links: Links<dyn DeliverToRead>,
 }
 
 impl ThreadError {
     fn new() -> Self {
         Self {
             error_code: AtomicU32::new(BR_OK),
-            links: Links::new(),
         }
     }
 
@@ -1615,15 +1613,11 @@ impl ThreadError {
 }
 
 impl DeliverToRead for ThreadError {
-    fn do_work(self: Arc<Self>, _thread: &Thread, writer: &mut UserSlicePtrWriter) -> Result<bool> {
+    fn do_work(self: DArc<Self>, _thread: &Thread, writer: &mut UserSlicePtrWriter) -> Result<bool> {
         let code = self.error_code.load(Ordering::Relaxed);
         self.error_code.store(BR_OK, Ordering::Relaxed);
         writer.write(&code)?;
         Ok(true)
-    }
-
-    fn get_links(&self) -> &Links<dyn DeliverToRead> {
-        &self.links
     }
 
     fn should_sync_wakeup(&self) -> bool {

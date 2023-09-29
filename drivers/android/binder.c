@@ -3956,7 +3956,7 @@ err_invalid_target_handle:
  *
  * Cleanup buffer and free it.
  */
-static void
+static void noinline
 binder_free_buf(struct binder_proc *proc,
 		struct binder_thread *thread,
 		struct binder_buffer *buffer, bool is_failure)

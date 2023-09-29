@@ -49,18 +49,15 @@ trait DeliverToRead {
     /// Performs work. Returns true if remaining work items in the queue should be processed
     /// immediately, or false if it should return to caller before processing additional work
     /// items.
-    fn do_work(self: Arc<Self>, thread: &Thread, writer: &mut UserSlicePtrWriter) -> Result<bool>;
+    fn do_work(self: DArc<Self>, thread: &Thread, writer: &mut UserSlicePtrWriter) -> Result<bool>;
 
     /// Cancels the given work item. This is called instead of [`DeliverToRead::do_work`] when work
     /// won't be delivered.
-    fn cancel(self: Arc<Self>) {}
+    fn cancel(self: DArc<Self>) {}
 
     /// Called when a work item is delivered directly to a specific thread, rather than to the
     /// process work list.
     fn on_thread_selected(&self, _thread: &thread::Thread) {}
-
-    /// Returns the linked list links for the work item.
-    fn get_links(&self) -> &Links<dyn DeliverToRead>;
 
     /// Should we use `wake_up_interruptible_sync` or `wake_up_interruptible` when scheduling this
     /// work item?
@@ -82,20 +79,51 @@ trait DeliverToRead {
 struct DeliverToReadListAdapter {}
 
 impl GetLinks for DeliverToReadListAdapter {
-    type EntryType = dyn DeliverToRead;
+    type EntryType = DTRWrap<dyn DeliverToRead>;
     fn get_links(data: &Self::EntryType) -> &Links<Self::EntryType> {
-        data.get_links()
+        &data.links
+    }
+} 
+
+impl GetLinksWrapped for DeliverToReadListAdapter {
+    type Wrapped = DArc<dyn DeliverToRead>;
+}
+
+fn arc_try_new<T>(val: T) -> Result<DArc<T>, alloc::alloc::AllocError> {
+    Arc::try_new(DTRWrap {
+        links: Links::new(),
+        wrpd: val,
+    })
+}
+
+fn arc_pin_init<T>(init: impl PinInit<T>) -> Result<DArc<T>, kernel::error::Error> {
+    Arc::pin_init(pin_init!(DTRWrap {
+        wrpd <- init,
+        links: Links::new(),
+    }))
+}
+
+#[pin_data]
+struct DTRWrap<T: ?Sized> {
+    links: Links<DTRWrap<dyn DeliverToRead>>,
+    #[pin]
+    wrpd: T,
+}
+
+impl<T: ?Sized> core::ops::Deref for DTRWrap<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.wrpd
     }
 }
 
-impl GetLinksWrapped for DeliverToReadListAdapter {
-    type Wrapped = Arc<dyn DeliverToRead>;
-}
+impl<T: ?Sized> core::ops::Receiver for DTRWrap<T> {}
+
+type DArc<T> = kernel::sync::Arc<DTRWrap<T>>;
 
 struct DeliverCode {
     code: u32,
     skip: AtomicBool,
-    links: Links<dyn DeliverToRead>,
 }
 
 impl DeliverCode {
@@ -103,7 +131,6 @@ impl DeliverCode {
         Self {
             code,
             skip: AtomicBool::new(false),
-            links: Links::new(),
         }
     }
 
@@ -117,14 +144,11 @@ impl DeliverCode {
 }
 
 impl DeliverToRead for DeliverCode {
-    fn do_work(self: Arc<Self>, _thread: &Thread, writer: &mut UserSlicePtrWriter) -> Result<bool> {
+    fn do_work(self: DArc<Self>, _thread: &Thread, writer: &mut UserSlicePtrWriter) -> Result<bool> {
         if !self.skip.load(Ordering::Relaxed) {
             writer.write(&self.code)?;
         }
         Ok(true)
-    }
-    fn get_links(&self) -> &Links<dyn DeliverToRead> {
-        &self.links
     }
     fn should_sync_wakeup(&self) -> bool {
         false

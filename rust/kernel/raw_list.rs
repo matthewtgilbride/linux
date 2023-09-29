@@ -8,7 +8,6 @@ use core::{
     cell::UnsafeCell,
     ptr,
     ptr::NonNull,
-    sync::atomic::{AtomicBool, Ordering},
 };
 
 /// A descriptor of list elements.
@@ -31,7 +30,7 @@ pub trait GetLinks {
 /// Instances of this type are usually embedded in structures and returned in calls to
 /// [`GetLinks::get_links`].
 pub struct Links<T: ?Sized> {
-    inserted: AtomicBool,
+    inserted: UnsafeCell<bool>,
     entry: UnsafeCell<ListEntry<T>>,
 }
 
@@ -42,19 +41,25 @@ impl<T: ?Sized> Links<T> {
     /// Constructs a new [`Links`] instance that isn't inserted on any lists yet.
     pub fn new() -> Self {
         Self {
-            inserted: AtomicBool::new(false),
+            inserted: UnsafeCell::new(false),
             entry: UnsafeCell::new(ListEntry::new()),
         }
     }
 
     fn acquire_for_insertion(&self) -> bool {
-        self.inserted
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
+        let inserted = unsafe { &mut *self.inserted.get() };
+        let did_acquire = *inserted == false;
+        *inserted = true;
+        did_acquire
+        //self.inserted
+        //    .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        //    .is_ok()
     }
 
     fn release_after_removal(&self) {
-        self.inserted.store(false, Ordering::Release);
+        let inserted = unsafe { &mut *self.inserted.get() };
+        *inserted = false;
+        //self.inserted.store(false, Ordering::Release);
     }
 }
 

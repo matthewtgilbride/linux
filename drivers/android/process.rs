@@ -40,7 +40,7 @@ use crate::{
     prio::{self, BinderPriority},
     range_alloc::{self, RangeAllocator},
     thread::{PushWorkRes, Thread},
-    DeliverToRead, DeliverToReadListAdapter,
+    DeliverToRead, DeliverToReadListAdapter, DArc,
 };
 
 use core::mem::take;
@@ -68,7 +68,7 @@ pub(crate) struct ProcessInner {
     ready_threads: List<Arc<Thread>>,
     work: List<DeliverToReadListAdapter>,
     mapping: Option<Mapping>,
-    nodes: RBTree<usize, Arc<Node>>,
+    nodes: RBTree<usize, DArc<Node>>,
     delivered_deaths: List<DeliveredNodeDeath>,
 
     /// The number of requested threads that haven't registered yet.
@@ -128,8 +128,8 @@ impl ProcessInner {
     /// taken while holding the inner process lock.
     pub(crate) fn push_work(
         &mut self,
-        work: Arc<dyn DeliverToRead>,
-    ) -> Result<(), (BinderError, Arc<dyn DeliverToRead>)> {
+        work: DArc<dyn DeliverToRead>,
+    ) -> Result<(), (BinderError, DArc<dyn DeliverToRead>)> {
         // Try to find a ready thread to which to push the work.
         if let Some(thread) = self.ready_threads.pop_front() {
             work.on_thread_selected(&thread);
@@ -174,7 +174,7 @@ impl ProcessInner {
     }
 
     /// Push work to be cancelled. Only used during process teardown.
-    pub(crate) fn push_work_for_release(&mut self, work: Arc<dyn DeliverToRead>) {
+    pub(crate) fn push_work_for_release(&mut self, work: DArc<dyn DeliverToRead>) {
         self.work.push_back(work);
     }
 
@@ -185,7 +185,7 @@ impl ProcessInner {
     /// Updates the reference count on the given node.
     pub(crate) fn update_node_refcount(
         &mut self,
-        node: &Arc<Node>,
+        node: &DArc<Node>,
         inc: bool,
         strong: bool,
         count: usize,
@@ -208,7 +208,7 @@ impl ProcessInner {
 
     pub(crate) fn new_node_ref(
         &mut self,
-        node: Arc<Node>,
+        node: DArc<Node>,
         strong: bool,
         thread: Option<&Thread>,
     ) -> NodeRef {
@@ -220,7 +220,7 @@ impl ProcessInner {
     /// Returns an existing node with the given pointer and cookie, if one exists.
     ///
     /// Returns an error if a node with the given pointer but a different cookie exists.
-    fn get_existing_node(&self, ptr: usize, cookie: usize) -> Result<Option<Arc<Node>>> {
+    fn get_existing_node(&self, ptr: usize, cookie: usize) -> Result<Option<DArc<Node>>> {
         match self.nodes.get(&ptr) {
             None => Ok(None),
             Some(node) => {
@@ -261,7 +261,7 @@ impl ProcessInner {
 
     /// Finds a delivered death notification with the given cookie, removes it from the thread's
     /// delivered list, and returns it.
-    fn pull_delivered_death(&mut self, cookie: usize) -> Option<Arc<NodeDeath>> {
+    fn pull_delivered_death(&mut self, cookie: usize) -> Option<DArc<NodeDeath>> {
         let mut cursor = self.delivered_deaths.cursor_front_mut();
         while let Some(death) = cursor.current() {
             if death.cookie == cookie {
@@ -272,7 +272,7 @@ impl ProcessInner {
         None
     }
 
-    pub(crate) fn death_delivered(&mut self, death: Arc<NodeDeath>) {
+    pub(crate) fn death_delivered(&mut self, death: DArc<NodeDeath>) {
         self.delivered_deaths.push_back(death);
     }
 
@@ -295,7 +295,7 @@ impl ProcessInner {
 
 struct NodeRefInfo {
     node_ref: NodeRef,
-    death: Option<Arc<NodeDeath>>,
+    death: Option<DArc<NodeDeath>>,
 }
 
 impl NodeRefInfo {
@@ -500,7 +500,7 @@ impl Process {
     }
 
     /// Attempts to fetch a work item from the process queue.
-    pub(crate) fn get_work(&self) -> Option<Arc<dyn DeliverToRead>> {
+    pub(crate) fn get_work(&self) -> Option<DArc<dyn DeliverToRead>> {
         self.inner.lock().work.pop_front()
     }
 
@@ -513,7 +513,7 @@ impl Process {
     pub(crate) fn get_work_or_register<'a>(
         &'a self,
         thread: &'a Arc<Thread>,
-    ) -> Either<Arc<dyn DeliverToRead>, Registration<'a>> {
+    ) -> Either<DArc<dyn DeliverToRead>, Registration<'a>> {
         let mut inner = self.inner.lock();
         // Try to get work from the process queue.
         if let Some(work) = inner.work.pop_front() {
@@ -547,7 +547,7 @@ impl Process {
         Ok(ta)
     }
 
-    pub(crate) fn push_work(&self, work: Arc<dyn DeliverToRead>) -> BinderResult {
+    pub(crate) fn push_work(&self, work: DArc<dyn DeliverToRead>) -> BinderResult {
         // If push_work fails, drop the work item outside the lock.
         let res = self.inner.lock().push_work(work);
         match res {
@@ -603,7 +603,7 @@ impl Process {
         }
 
         // Allocate the node before reacquiring the lock.
-        let node = Arc::try_new(Node::new(ptr, cookie, flags, self.into()))?;
+        let node = crate::arc_try_new(Node::new(ptr, cookie, flags, self.into()))?;
         let rbnode = RBTree::try_allocate_node(ptr, node.clone())?;
         let mut inner = self.inner.lock();
         if let Some(node) = inner.get_existing_node_ref(ptr, cookie, strong, thread)? {
@@ -687,7 +687,7 @@ impl Process {
             .clone(strong)
     }
 
-    pub(crate) fn remove_from_delivered_deaths(&self, death: &Arc<NodeDeath>) {
+    pub(crate) fn remove_from_delivered_deaths(&self, death: &DArc<NodeDeath>) {
         let mut inner = self.inner.lock();
         let removed = unsafe { inner.delivered_deaths.remove(death) };
         drop(inner);

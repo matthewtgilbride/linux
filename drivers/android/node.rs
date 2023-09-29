@@ -18,7 +18,7 @@ use crate::{
     process::{Process, ProcessInner},
     thread::Thread,
     transaction::Transaction,
-    DeliverToRead, DeliverToReadListAdapter,
+    DeliverToRead, DeliverToReadListAdapter, DArc, DTRWrap,
 };
 
 struct CountState {
@@ -41,7 +41,7 @@ impl CountState {
 struct NodeInner {
     strong: CountState,
     weak: CountState,
-    death_list: List<Arc<NodeDeath>>,
+    death_list: List<DArc<NodeDeath>>,
     oneway_todo: List<DeliverToReadListAdapter>,
     has_pending_oneway_todo: bool,
     /// The number of active BR_INCREFS or BR_ACQUIRE operations. (should be maximum two)
@@ -59,7 +59,6 @@ pub(crate) struct Node {
     pub(crate) flags: u32,
     pub(crate) owner: Arc<Process>,
     inner: LockedBy<NodeInner, ProcessInner>,
-    links: Links<dyn DeliverToRead>,
 }
 
 impl Node {
@@ -84,7 +83,6 @@ impl Node {
             cookie,
             flags,
             owner,
-            links: Links::new(),
         }
     }
 
@@ -146,13 +144,13 @@ impl Node {
     pub(crate) fn next_death(
         &self,
         guard: &mut Guard<'_, ProcessInner, SpinLockBackend>,
-    ) -> Option<Arc<NodeDeath>> {
+    ) -> Option<DArc<NodeDeath>> {
         self.inner.access_mut(guard).death_list.pop_front()
     }
 
     pub(crate) fn add_death(
         &self,
-        death: Arc<NodeDeath>,
+        death: DArc<NodeDeath>,
         guard: &mut Guard<'_, ProcessInner, SpinLockBackend>,
     ) {
         self.inner.access_mut(guard).death_list.push_back(death);
@@ -220,7 +218,7 @@ impl Node {
         }
     }
 
-    pub(crate) fn update_refcount(self: &Arc<Self>, inc: bool, count: usize, strong: bool) {
+    pub(crate) fn update_refcount(self: &DArc<Self>, inc: bool, count: usize, strong: bool) {
         self.owner
             .inner
             .lock()
@@ -268,9 +266,9 @@ impl Node {
 
     pub(crate) fn submit_oneway(
         &self,
-        transaction: Arc<Transaction>,
+        transaction: DArc<Transaction>,
         guard: &mut Guard<'_, ProcessInner, SpinLockBackend>,
-    ) -> Result<(), (BinderError, Arc<dyn DeliverToRead>)> {
+    ) -> Result<(), (BinderError, DArc<dyn DeliverToRead>)> {
         if guard.is_dead {
             return Err((BinderError::new_dead(), transaction));
         }
@@ -330,7 +328,7 @@ impl Node {
         &self,
         new: &Transaction,
         guard: &mut Guard<'_, ProcessInner, SpinLockBackend>,
-    ) -> Option<Arc<dyn DeliverToRead>> {
+    ) -> Option<DArc<dyn DeliverToRead>> {
         let inner = self.inner.access_mut(guard);
         let mut cursor = inner.oneway_todo.cursor_front_mut();
         while let Some(old) = cursor.current() {
@@ -346,7 +344,7 @@ impl Node {
 }
 
 impl DeliverToRead for Node {
-    fn do_work(self: Arc<Self>, _thread: &Thread, writer: &mut UserSlicePtrWriter) -> Result<bool> {
+    fn do_work(self: DArc<Self>, _thread: &Thread, writer: &mut UserSlicePtrWriter) -> Result<bool> {
         let mut owner_inner = self.owner.inner.lock();
         let inner = self.inner.access_mut(&mut owner_inner);
         let strong = inner.strong.count > 0;
@@ -395,10 +393,6 @@ impl DeliverToRead for Node {
         Ok(true)
     }
 
-    fn get_links(&self) -> &Links<dyn DeliverToRead> {
-        &self.links
-    }
-
     fn should_sync_wakeup(&self) -> bool {
         false
     }
@@ -414,7 +408,7 @@ impl DeliverToRead for Node {
 /// refcount on the target node, and this is implemented by storing a `NodeRef` in the allocation
 /// so that the destructor of the allocation will drop a refcount of the `Node`.
 pub(crate) struct NodeRef {
-    pub(crate) node: Arc<Node>,
+    pub(crate) node: DArc<Node>,
     /// How many times does this NodeRef hold a refcount on the Node?
     strong_node_count: usize,
     weak_node_count: usize,
@@ -424,7 +418,7 @@ pub(crate) struct NodeRef {
 }
 
 impl NodeRef {
-    pub(crate) fn new(node: Arc<Node>, strong_count: usize, weak_count: usize) -> Self {
+    pub(crate) fn new(node: DArc<Node>, strong_count: usize, weak_count: usize) -> Self {
         Self {
             node,
             strong_node_count: strong_count,
@@ -547,25 +541,22 @@ struct NodeDeathInner {
 /// deregistering death notifications, so this codepath is not executed under normal circumstances.
 #[pin_data]
 pub(crate) struct NodeDeath {
-    node: Arc<Node>,
+    node: DArc<Node>,
     process: Arc<Process>,
     pub(crate) cookie: usize,
-    /// Used to enqueue this to a process or thread worklist, when notifications need to be
-    /// delivered to userspaace.
-    work_links: Links<dyn DeliverToRead>,
     /// Used by the owner `Node` to store a list of registered death notifications.
     ///
     /// # Invariants
     ///
     /// Only ever used with the `death_list` list of `self.node`.
-    death_links: Links<NodeDeath>,
+    death_links: Links<DTRWrap<NodeDeath>>,
     /// Used by the process to keep track of the death notifications for which we have sent a
     /// `BR_DEAD_BINDER` but not yet received a `BC_DEAD_BINDER_DONE`.
     ///
     /// # Invariants
     ///
     /// Only ever used with the `delivered_deaths` list of `self.process`.
-    delivered_links: Links<NodeDeath>,
+    delivered_links: Links<DTRWrap<NodeDeath>>,
     #[pin]
     inner: SpinLock<NodeDeathInner>,
 }
@@ -574,13 +565,14 @@ pub(crate) struct DeliveredNodeDeath;
 
 impl NodeDeath {
     /// Constructs a new node death notification object.
-    pub(crate) fn new(node: Arc<Node>, process: Arc<Process>, cookie: usize) -> impl PinInit<Self> {
+    pub(crate) fn new(node: DArc<Node>, process: Arc<Process>, cookie: usize) -> impl PinInit<DTRWrap<Self>> {
         pin_init!(
-            Self {
+            DTRWrap {
+            links: Links::new(),
+            wrpd <- pin_init!(Self {
                 node,
                 process,
                 cookie,
-                work_links: Links::new(),
                 death_links: Links::new(),
                 delivered_links: Links::new(),
                 inner <- kernel::new_spinlock!(NodeDeathInner {
@@ -589,6 +581,7 @@ impl NodeDeath {
                     notification_done: false,
                     aborted: false,
                 }, "NodeDeath::inner"),
+            })
             }
         )
     }
@@ -598,7 +591,7 @@ impl NodeDeath {
     /// It removes `self` from the node's death notification list if needed.
     ///
     /// Returns whether it needs to be queued.
-    pub(crate) fn set_cleared(self: &Arc<Self>, abort: bool) -> bool {
+    pub(crate) fn set_cleared(self: &DArc<Self>, abort: bool) -> bool {
         let (needs_removal, needs_queueing) = {
             // Update state and determine if we need to queue a work item. We only need to do it
             // when the node is not dead or if the user already completed the death notification.
@@ -628,7 +621,7 @@ impl NodeDeath {
     /// Sets the 'notification done' flag to `true`.
     ///
     /// Returns whether it needs to be queued.
-    pub(crate) fn set_notification_done(self: Arc<Self>, thread: &Thread) {
+    pub(crate) fn set_notification_done(self: DArc<Self>, thread: &Thread) {
         let needs_queueing = {
             let mut inner = self.inner.lock();
             inner.notification_done = true;
@@ -640,7 +633,7 @@ impl NodeDeath {
     }
 
     /// Sets the 'dead' flag to `true` and queues work item if needed.
-    pub(crate) fn set_dead(self: Arc<Self>) {
+    pub(crate) fn set_dead(self: DArc<Self>) {
         let needs_queueing = {
             let mut inner = self.inner.lock();
             if inner.cleared {
@@ -659,26 +652,26 @@ impl NodeDeath {
     }
 }
 
-impl GetLinks for NodeDeath {
-    type EntryType = NodeDeath;
-    fn get_links(data: &NodeDeath) -> &Links<NodeDeath> {
+impl GetLinks for DTRWrap<NodeDeath> {
+    type EntryType = DTRWrap<NodeDeath>;
+    fn get_links(data: &DTRWrap<NodeDeath>) -> &Links<DTRWrap<NodeDeath>> {
         &data.death_links
     }
 }
 
 impl GetLinks for DeliveredNodeDeath {
-    type EntryType = NodeDeath;
-    fn get_links(data: &NodeDeath) -> &Links<NodeDeath> {
+    type EntryType = DTRWrap<NodeDeath>;
+    fn get_links(data: &DTRWrap<NodeDeath>) -> &Links<DTRWrap<NodeDeath>> {
         &data.delivered_links
     }
 }
 
 impl GetLinksWrapped for DeliveredNodeDeath {
-    type Wrapped = Arc<NodeDeath>;
+    type Wrapped = DArc<NodeDeath>;
 }
 
 impl DeliverToRead for NodeDeath {
-    fn do_work(self: Arc<Self>, _thread: &Thread, writer: &mut UserSlicePtrWriter) -> Result<bool> {
+    fn do_work(self: DArc<Self>, _thread: &Thread, writer: &mut UserSlicePtrWriter) -> Result<bool> {
         let done = {
             let inner = self.inner.lock();
             if inner.aborted {
@@ -708,10 +701,6 @@ impl DeliverToRead for NodeDeath {
         // Mimic the original code: we stop processing work items when we get to a death
         // notification.
         Ok(cmd != BR_DEAD_BINDER)
-    }
-
-    fn get_links(&self) -> &Links<dyn DeliverToRead> {
-        &self.work_links
     }
 
     fn should_sync_wakeup(&self) -> bool {

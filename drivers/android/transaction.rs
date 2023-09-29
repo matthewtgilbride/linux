@@ -3,7 +3,6 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 use kernel::{
     io_buffer::IoBufferWriter,
-    linked_list::Links,
     prelude::*,
     seq_file::SeqFile,
     seq_print,
@@ -22,13 +21,13 @@ use crate::{
     process::{Process, ProcessInner},
     ptr_align,
     thread::{PushWorkRes, Thread},
-    DeliverToRead,
+    DeliverToRead, DArc, arc_pin_init,
 };
 
 #[pin_data(PinnedDrop)]
 pub(crate) struct Transaction {
-    target_node: Option<Arc<Node>>,
-    stack_next: Option<Arc<Transaction>>,
+    target_node: Option<DArc<Node>>,
+    stack_next: Option<DArc<Transaction>>,
     pub(crate) from: Arc<Thread>,
     to: Arc<Process>,
     #[pin]
@@ -43,7 +42,6 @@ pub(crate) struct Transaction {
     data_size: usize,
     offsets_size: usize,
     data_address: usize,
-    links: Links<dyn DeliverToRead>,
     sender_euid: Kuid,
     txn_security_ctx_off: Option<usize>,
     pub(crate) oneway_spam_detected: bool,
@@ -52,10 +50,10 @@ pub(crate) struct Transaction {
 impl Transaction {
     pub(crate) fn new(
         node_ref: NodeRef,
-        stack_next: Option<Arc<Transaction>>,
+        stack_next: Option<DArc<Transaction>>,
         from: &Arc<Thread>,
         tr: &BinderTransactionDataSg,
-    ) -> BinderResult<Arc<Self>> {
+    ) -> BinderResult<DArc<Self>> {
         let trd = &tr.transaction_data;
         let allow_fds = node_ref.node.flags & FLAT_BINDER_FLAG_ACCEPTS_FDS != 0;
         let txn_security_ctx = node_ref.node.flags & FLAT_BINDER_FLAG_TXN_SECURITY_CTX != 0;
@@ -100,7 +98,7 @@ impl Transaction {
                 from.process.default_priority
             };
 
-        Ok(Arc::pin_init(pin_init!(Transaction {
+        Ok(arc_pin_init(pin_init!(Transaction {
             target_node: Some(target_node),
             stack_next,
             sender_euid: from.process.cred.euid(),
@@ -111,7 +109,6 @@ impl Transaction {
             data_size: trd.data_size as _,
             offsets_size: trd.offsets_size as _,
             data_address,
-            links: Links::new(),
             allocation <- kernel::new_spinlock!(Some(alloc), "Transaction::new"),
             is_outstanding: AtomicBool::new(false),
             priority,
@@ -127,7 +124,7 @@ impl Transaction {
         to: Arc<Process>,
         tr: &BinderTransactionDataSg,
         allow_fds: bool,
-    ) -> BinderResult<Arc<Self>> {
+    ) -> BinderResult<DArc<Self>> {
         let trd = &tr.transaction_data;
         let mut alloc = match from.copy_transaction_data(to.clone(), tr, allow_fds, None) {
             Ok(alloc) => alloc,
@@ -141,7 +138,7 @@ impl Transaction {
             alloc.set_info_clear_on_drop();
         }
 
-        Ok(Arc::pin_init(pin_init!(Transaction {
+        Ok(arc_pin_init(pin_init!(Transaction {
             target_node: None,
             stack_next: None,
             sender_euid: from.process.task.euid(),
@@ -152,7 +149,6 @@ impl Transaction {
             data_size: trd.data_size as _,
             offsets_size: trd.offsets_size as _,
             data_address: alloc.ptr,
-            links: Links::new(),
             allocation <- kernel::new_spinlock!(Some(alloc), "Transaction::new"),
             is_outstanding: AtomicBool::new(false),
             priority: BinderPriority::default(),
@@ -191,7 +187,7 @@ impl Transaction {
     }
 
     /// Determines if the transaction is stacked on top of the given transaction.
-    pub(crate) fn is_stacked_on(&self, onext: &Option<Arc<Self>>) -> bool {
+    pub(crate) fn is_stacked_on(&self, onext: &Option<DArc<Self>>) -> bool {
         match (&self.stack_next, onext) {
             (None, None) => true,
             (Some(stack_next), Some(next)) => Arc::ptr_eq(stack_next, next),
@@ -200,7 +196,7 @@ impl Transaction {
     }
 
     /// Returns a pointer to the next transaction on the transaction stack, if there is one.
-    pub(crate) fn clone_next(&self) -> Option<Arc<Self>> {
+    pub(crate) fn clone_next(&self) -> Option<DArc<Self>> {
         Some(self.stack_next.as_ref()?.clone())
     }
 
@@ -219,7 +215,7 @@ impl Transaction {
     }
 
     /// Searches in the transaction stack for a transaction originating at the given thread.
-    pub(crate) fn find_from(&self, thread: &Thread) -> Option<Arc<Transaction>> {
+    pub(crate) fn find_from(&self, thread: &Thread) -> Option<DArc<Transaction>> {
         let mut it = &self.stack_next;
         while let Some(transaction) = it {
             if core::ptr::eq(thread, transaction.from.as_ref()) {
@@ -255,7 +251,7 @@ impl Transaction {
     /// stack, otherwise uses the destination process.
     ///
     /// Not used for replies.
-    pub(crate) fn submit(self: Arc<Self>) -> BinderResult {
+    pub(crate) fn submit(self: DArc<Self>) -> BinderResult {
         // Defined before `process_inner` so that the destructor runs after releasing the lock.
         let mut _t_outdated = None;
 
@@ -351,7 +347,7 @@ impl Transaction {
 }
 
 impl DeliverToRead for Transaction {
-    fn do_work(self: Arc<Self>, thread: &Thread, writer: &mut UserSlicePtrWriter) -> Result<bool> {
+    fn do_work(self: DArc<Self>, thread: &Thread, writer: &mut UserSlicePtrWriter) -> Result<bool> {
         let send_failed_reply = ScopeGuard::new(|| {
             if self.target_node.is_some() && self.flags & TF_ONE_WAY == 0 {
                 let reply = Either::Right(BR_FAILED_REPLY);
@@ -436,7 +432,7 @@ impl DeliverToRead for Transaction {
         Ok(false)
     }
 
-    fn cancel(self: Arc<Self>) {
+    fn cancel(self: DArc<Self>) {
         // If this is not a reply or oneway transaction, then send a dead reply.
         if self.target_node.is_some() && self.flags & TF_ONE_WAY == 0 {
             let reply = Either::Right(BR_DEAD_REPLY);
@@ -498,10 +494,6 @@ impl DeliverToRead for Transaction {
         drop(prio_state);
 
         to_thread.set_priority(&desired);
-    }
-
-    fn get_links(&self) -> &Links<dyn DeliverToRead> {
-        &self.links
     }
 
     fn should_sync_wakeup(&self) -> bool {

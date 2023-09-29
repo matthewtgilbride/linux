@@ -16,6 +16,7 @@ use crate::{
     defs::*,
     node::{Node, NodeRef},
     process::Process,
+    DArc,
 };
 
 #[derive(Default)]
@@ -29,7 +30,7 @@ pub(crate) struct AllocationInfo {
     ///
     /// This is used to serialize oneway transaction on the same node. Binder guarantees that
     /// oneway transactions to the same node are delivered sequentially in the order they are sent.
-    pub(crate) oneway_node: Option<Arc<Node>>,
+    pub(crate) oneway_node: Option<DArc<Node>>,
     /// Zero the data in the buffer on free.
     pub(crate) clear_on_free: bool,
     /// List of files embedded in this transaction.
@@ -139,7 +140,7 @@ impl Allocation {
         self.get_or_init_info().offsets = Some(offsets);
     }
 
-    pub(crate) fn set_info_oneway_node(&mut self, oneway_node: Arc<Node>) {
+    pub(crate) fn set_info_oneway_node(&mut self, oneway_node: DArc<Node>) {
         self.get_or_init_info().oneway_node = Some(oneway_node);
     }
 

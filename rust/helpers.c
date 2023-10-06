@@ -118,24 +118,6 @@ void rust_helper___spin_lock_init(spinlock_t *lock, const char *name,
 }
 EXPORT_SYMBOL_GPL(rust_helper___spin_lock_init);
 
-void rust_helper_spin_lock(spinlock_t *lock)
-{
-	spin_lock(lock);
-}
-EXPORT_SYMBOL_GPL(rust_helper_spin_lock);
-
-void rust_helper_spin_unlock(spinlock_t *lock)
-{
-	spin_unlock(lock);
-}
-EXPORT_SYMBOL_GPL(rust_helper_spin_unlock);
-
-int rust_helper_spin_trylock(spinlock_t *lock)
-{
-	return spin_trylock(lock);
-}
-EXPORT_SYMBOL_GPL(rust_helper_spin_trylock);
-
 void rust_helper_init_wait(struct wait_queue_entry *wq_entry)
 {
 	init_wait(wq_entry);

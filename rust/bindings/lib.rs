@@ -120,3 +120,52 @@ mod refcount_t_impl {
         }
     }
 }
+
+// Explicit imports always override glob imports.
+pub use self::spinlock_impl::{spin_lock, spin_unlock};
+
+#[cfg(not(CONFIG_PREEMPT_RT))]
+mod spinlock_impl {
+    use super::bindings_raw::*;
+
+    #[inline(always)]
+    fn get_raw(lock: *mut spinlock_t) -> *mut raw_spinlock_t {
+        // When CONFIG_PREEMPT_RT is not set, spinlock maps to raw spinlock.
+        lock.cast()
+    }
+
+    #[inline(always)]
+    pub unsafe fn spin_lock(lock: *mut spinlock_t) {
+        unsafe { _raw_spin_lock(get_raw(lock)) }
+    }
+
+    #[inline(always)]
+    pub unsafe fn spin_trylock(lock: *mut spinlock_t) {
+        unsafe { _raw_spin_trylock(get_raw(lock)) }
+    }
+
+    #[inline(always)]
+    pub unsafe fn spin_unlock(lock: *mut spinlock_t) {
+        unsafe { _raw_spin_unlock(get_raw(lock)) }
+    }
+}
+
+#[cfg(CONFIG_PREEMPT_RT)]
+mod spinlock_impl {
+    use super::bindings_raw::*;
+
+    #[inline(always)]
+    pub unsafe fn spin_lock(lock: *mut spinlock_t) {
+        unsafe { bindings::rt_spin_lock(lock) }
+    }
+
+    #[inline(always)]
+    pub unsafe fn spin_trylock(lock: *mut spinlock_t) {
+        unsafe { bindings::rt_spin_trylock(lock) }
+    }
+
+    #[inline(always)]
+    pub unsafe fn spin_unlock(lock: *mut spinlock_t) {
+        unsafe { bindings::rt_spin_unlock(lock) }
+    }
+}

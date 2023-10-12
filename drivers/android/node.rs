@@ -496,6 +496,7 @@ impl NodeRef {
 }
 
 impl Drop for NodeRef {
+    #[inline(always)]
     fn drop(&mut self) {
         if self.strong_node_count > 0 {
             self.node

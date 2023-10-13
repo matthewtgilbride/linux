@@ -122,7 +122,7 @@ mod refcount_t_impl {
 }
 
 // Explicit imports always override glob imports.
-pub use self::spinlock_impl::{spin_lock, spin_unlock};
+pub use self::spinlock_impl::{spin_lock, spin_trylock, spin_unlock};
 
 #[cfg(not(CONFIG_PREEMPT_RT))]
 mod spinlock_impl {
@@ -140,7 +140,7 @@ mod spinlock_impl {
     }
 
     #[inline(always)]
-    pub unsafe fn spin_trylock(lock: *mut spinlock_t) {
+    pub unsafe fn spin_trylock(lock: *mut spinlock_t) -> i32 {
         unsafe { _raw_spin_trylock(get_raw(lock)) }
     }
 
@@ -160,7 +160,7 @@ mod spinlock_impl {
     }
 
     #[inline(always)]
-    pub unsafe fn spin_trylock(lock: *mut spinlock_t) {
+    pub unsafe fn spin_trylock(lock: *mut spinlock_t) -> i32 {
         unsafe { bindings::rt_spin_trylock(lock) }
     }
 

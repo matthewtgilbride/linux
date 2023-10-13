@@ -140,18 +140,6 @@ impl Allocation {
         self.get_or_init_info().offsets = Some(offsets);
     }
 
-    pub(crate) fn set_info_oneway_node(&mut self, oneway_node: DArc<Node>) {
-        self.get_or_init_info().oneway_node = Some(oneway_node);
-    }
-
-    pub(crate) fn set_info_clear_on_drop(&mut self) {
-        self.get_or_init_info().clear_on_free = true;
-    }
-
-    pub(crate) fn set_info_target_node(&mut self, target_node: NodeRef) {
-        self.get_or_init_info().target_node = Some(target_node);
-    }
-
     /// Reserve enough space to push at least `num_fds` fds.
     pub(crate) fn info_add_fd_reserve(&mut self, num_fds: usize) -> Result {
         self.get_or_init_info()

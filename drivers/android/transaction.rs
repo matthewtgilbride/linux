@@ -73,20 +73,19 @@ impl Transaction {
                 return Err(err);
             }
         };
-        let oneway_spam_detected = alloc.oneway_spam_detected;
+        let info = alloc.get_or_init_info();
         if trd.flags & TF_ONE_WAY != 0 {
             if stack_next.is_some() {
                 pr_warn!("Oneway transaction should not be in a transaction stack.");
                 return Err(EINVAL.into());
             }
-            alloc.set_info_oneway_node(node_ref.node.clone());
+            info.oneway_node = Some(node_ref.node.clone());
         }
-        if trd.flags & TF_CLEAR_BUF != 0 {
-            alloc.set_info_clear_on_drop();
-        }
+        info.clear_on_free = trd.flags & TF_CLEAR_BUF != 0;
         let target_node = node_ref.node.clone();
-        alloc.set_info_target_node(node_ref);
+        info.target_node = Some(node_ref);
         let data_address = alloc.ptr;
+        let oneway_spam_detected = alloc.oneway_spam_detected;
 
         let priority =
             if (trd.flags & TF_ONE_WAY == 0) && prio::is_supported_policy(from.task.policy()) {
@@ -133,10 +132,9 @@ impl Transaction {
                 return Err(err);
             }
         };
+        let info = alloc.get_or_init_info();
+        info.clear_on_free = trd.flags & TF_CLEAR_BUF != 0;
         let oneway_spam_detected = alloc.oneway_spam_detected;
-        if trd.flags & TF_CLEAR_BUF != 0 {
-            alloc.set_info_clear_on_drop();
-        }
 
         Ok(arc_pin_init(pin_init!(Transaction {
             target_node: None,

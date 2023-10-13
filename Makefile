@@ -594,7 +594,7 @@ KBUILD_CFLAGS += -Wno-trigraphs
 KBUILD_CPPFLAGS := -D__KERNEL__
 KBUILD_RUSTFLAGS := $(rust_common_flags) \
 		    --target=$(objtree)/scripts/target.json \
-		    -Cpanic=abort -Cembed-bitcode=n -Clto=n \
+		    -Cpanic=abort -Cembed-bitcode=y -Clto=thin \
 		    -Cforce-unwind-tables=n -Ccodegen-units=1 \
 		    -Csymbol-mangling-version=v0 \
 		    -Crelocation-model=static \

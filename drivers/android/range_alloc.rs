@@ -101,7 +101,7 @@ impl<T> RangeAllocator<T> {
         is_oneway: bool,
         pid: Pid,
         alloc: ReserveNewBox<T>,
-    ) -> Result<usize> {
+    ) -> Result<(usize, AllocPtr<T>)> {
         // Compute new value of free_oneway_space, which is set only on success.
         let new_oneway_space = if is_oneway {
             match self.free_oneway_space.checked_sub(size) {
@@ -142,7 +142,7 @@ impl<T> RangeAllocator<T> {
             unsafe { self.list.insert_after(desc_ptr, new) };
         }
 
-        Ok(desc.offset)
+        Ok((desc.offset, AllocPtr { ptr: desc_ptr }))
     }
 
     /// Free the provided allocation, then merge adjacent free regions if necessary.
@@ -231,9 +231,9 @@ impl<T> RangeAllocator<T> {
         Ok(freed_range)
     }
 
-    pub(crate) fn reservation_commit(&mut self, offset: usize, data: Option<T>) -> Result {
-        let mut cursor = self.find_at_offset(offset).ok_or(ENOENT)?;
-        let desc = cursor.current().unwrap();
+    pub(crate) fn reservation_commit(&mut self, ptr: AllocPtr<T>, data: Option<T>) -> Result {
+        // SAFETY: We hold the lock, so we can access it.
+        let desc = unsafe { &mut *(ptr.ptr.as_ptr()) };
         let (is_oneway, pid) = match desc.state {
             DescriptorState::Reserved { is_oneway, pid } => (is_oneway, pid),
             _ => return Err(ENOENT),
@@ -247,25 +247,27 @@ impl<T> RangeAllocator<T> {
     /// [`DescriptorState::Reserved`].
     ///
     /// Returns the size of the existing entry and the data associated with it.
-    pub(crate) fn reserve_existing(&mut self, offset: usize) -> Result<(usize, Option<T>)> {
+    pub(crate) fn reserve_existing(&mut self, offset: usize) -> Result<(usize, AllocPtr<T>, Option<T>)> {
         let mut cursor = self.find_at_offset(offset).ok_or(ENOENT)?;
         let desc = cursor.current().unwrap();
+        let desc_ptr = AllocPtr { ptr: desc.into() };
         let (is_oneway, pid) = match desc.state {
             DescriptorState::Allocated { is_oneway, pid } => (is_oneway, pid),
             _ => return Err(ENOENT),
         };
         desc.state = DescriptorState::Reserved { is_oneway, pid };
-        Ok((desc.size, desc.data.take()))
+        Ok((desc.size, desc_ptr, desc.data.take()))
     }
 
     /// Call the provided callback at every allocated region.
     ///
     /// This destroys the range allocator. Used only during shutdown.
-    pub(crate) fn take_for_each<F: Fn(usize, usize, Option<T>)>(&mut self, callback: F) {
+    pub(crate) fn take_for_each<F: Fn(usize, usize, AllocPtr<T>, Option<T>)>(&mut self, callback: F) {
         let mut cursor = self.list.cursor_front_mut();
         while let Some(desc) = cursor.current() {
+            let desc_ptr = AllocPtr { ptr: desc.into() };
             if desc.state.is_allocated() {
-                callback(desc.offset, desc.size, desc.data.take());
+                callback(desc.offset, desc.size, desc_ptr, desc.data.take());
             }
             cursor.move_next();
         }
@@ -301,6 +303,20 @@ impl<T> RangeAllocator<T> {
         num_buffers > 50 || total_alloc_size > self.size / 4
     }
 }
+
+pub(crate) struct AllocPtr<T> {
+    ptr: NonNull<Descriptor<T>>,
+}
+
+impl<T> Copy for AllocPtr<T> {}
+impl<T> Clone for AllocPtr<T> {
+    fn clone(&self) -> Self {
+        Self { ptr: self.ptr }
+    }
+}
+
+unsafe impl<T: Send + Sync> Send for AllocPtr<T> {}
+unsafe impl<T: Send + Sync> Sync for AllocPtr<T> {}
 
 struct Descriptor<T> {
     state: DescriptorState,

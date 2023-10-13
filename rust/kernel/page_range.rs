@@ -423,7 +423,7 @@ impl ShrinkablePageRange {
         let inner = self.lock.lock();
         assert!(end <= inner.size);
 
-        for i in start..end {
+        for i in (start..end).rev() {
             // SAFETY: The pointer is in bounds.
             let page_info = unsafe { inner.pages.add(i) };
 

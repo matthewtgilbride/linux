@@ -2,6 +2,8 @@
 
 //! Binder -- the Android IPC mechanism.
 
+#![recursion_limit = "256"]
+
 use kernel::{
     bindings::{self, seq_file},
     file::{File, PollTable},

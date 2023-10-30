@@ -38,16 +38,16 @@ use crate::{
     error::{BinderError, BinderResult},
     node::{DeliveredNodeDeath, Node, NodeDeath, NodeRef},
     prio::{self, BinderPriority},
-    range_alloc::{self, RangeAllocator},
+    range_alloc::{self, RangeAllocator, StopWatchResult},
     thread::{PushWorkRes, Thread},
     DeliverToRead, DeliverToReadListAdapter, DArc,
 };
 
 use core::mem::take;
 
-struct Mapping {
+pub(crate) struct Mapping {
     address: usize,
-    alloc: RangeAllocator<AllocationInfo>,
+    pub(crate) alloc: RangeAllocator<AllocationInfo>,
 }
 
 impl Mapping {
@@ -67,7 +67,7 @@ pub(crate) struct ProcessInner {
     threads: RBTree<i32, Arc<Thread>>,
     ready_threads: List<Arc<Thread>>,
     work: List<DeliverToReadListAdapter>,
-    mapping: Option<Mapping>,
+    pub(crate) mapping: Option<Mapping>,
     nodes: RBTree<usize, DArc<Node>>,
     delivered_deaths: List<DeliveredNodeDeath>,
 
@@ -290,6 +290,13 @@ impl ProcessInner {
             }
         }
         false
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn record_perf(&mut self, data: Box<[StopWatchResult; 100000]>) {
+        if let Some(ref mut mapping) = &mut self.mapping {
+            mapping.alloc.record_perf(data);
+        }
     }
 }
 

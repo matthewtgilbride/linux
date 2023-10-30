@@ -18,6 +18,7 @@ pub(crate) struct RangeAllocator<T> {
     list: List<Box<Descriptor<T>>>,
     free_oneway_space: usize,
     pub(crate) oneway_spam_detected: bool,
+    pub(crate) perf_results: PerfResults,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -69,6 +70,7 @@ impl<T> RangeAllocator<T> {
         Ok(Self {
             free_oneway_space: size / 2,
             oneway_spam_detected: false,
+            perf_results: PerfResults::new(),
             size,
             list,
         })
@@ -102,6 +104,7 @@ impl<T> RangeAllocator<T> {
         pid: Pid,
         alloc: ReserveNewBox<T>,
     ) -> Result<(usize, AllocPtr<T>)> {
+        let stop_watch = StopWatch::start("reserve_new");
         // Compute new value of free_oneway_space, which is set only on success.
         let new_oneway_space = if is_oneway {
             match self.free_oneway_space.checked_sub(size) {
@@ -142,6 +145,7 @@ impl<T> RangeAllocator<T> {
             unsafe { self.list.insert_after(desc_ptr, new) };
         }
 
+        self.perf_results.add(stop_watch.stop());
         Ok((desc.offset, AllocPtr { ptr: desc_ptr }))
     }
 
@@ -225,13 +229,16 @@ impl<T> RangeAllocator<T> {
     }
 
     pub(crate) fn reservation_abort(&mut self, offset: usize) -> Result<FreedRange> {
+        let stop_watch = StopWatch::start("reservation_abort");
         let mut cursor = self.find_at_offset(offset).ok_or(EINVAL)?;
         let (free_oneway_space_add, freed_range) = Self::free_with_cursor(&mut cursor)?;
         self.free_oneway_space += free_oneway_space_add;
+        self.perf_results.add(stop_watch.stop());
         Ok(freed_range)
     }
 
     pub(crate) fn reservation_commit(&mut self, ptr: AllocPtr<T>, data: Option<T>) -> Result {
+        let stop_watch = StopWatch::start("reservation_commit");
         // SAFETY: We hold the lock, so we can access it.
         let desc = unsafe { &mut *(ptr.ptr.as_ptr()) };
         let (is_oneway, pid) = match desc.state {
@@ -240,6 +247,7 @@ impl<T> RangeAllocator<T> {
         };
         desc.state = DescriptorState::Allocated { is_oneway, pid };
         desc.data = data;
+        self.perf_results.add(stop_watch.stop());
         Ok(())
     }
 
@@ -248,6 +256,7 @@ impl<T> RangeAllocator<T> {
     ///
     /// Returns the size of the existing entry and the data associated with it.
     pub(crate) fn reserve_existing(&mut self, offset: usize) -> Result<(usize, AllocPtr<T>, Option<T>)> {
+        let stop_watch = StopWatch::start("reserve_existing");
         let mut cursor = self.find_at_offset(offset).ok_or(ENOENT)?;
         let desc = cursor.current().unwrap();
         let desc_ptr = AllocPtr { ptr: desc.into() };
@@ -256,7 +265,9 @@ impl<T> RangeAllocator<T> {
             _ => return Err(ENOENT),
         };
         desc.state = DescriptorState::Reserved { is_oneway, pid };
-        Ok((desc.size, desc_ptr, desc.data.take()))
+        let result = Ok((desc.size, desc_ptr, desc.data.take()));
+        self.perf_results.add(stop_watch.stop());
+        result
     }
 
     /// Call the provided callback at every allocated region.
@@ -301,6 +312,11 @@ impl<T> RangeAllocator<T> {
         // async space (which is 25% of total buffer size). Oneway spam is only
         // detected when the threshold is exceeded.
         num_buffers > 50 || total_alloc_size > self.size / 4
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn record_perf(&mut self, data: Box<[StopWatchResult; 100000]>) {
+        self.perf_results.data = Some(data);
     }
 }
 
@@ -366,6 +382,65 @@ impl<T> ReserveNewBox<T> {
             let inner = Box::into_raw(self.inner) as *mut Descriptor<T>;
             core::ptr::write(inner, desc);
             Box::from_raw(inner)
+        }
+    }
+}
+
+pub(crate) struct PerfResults {
+    pub(crate) data: Option<Box<[StopWatchResult; 100000]>>,
+    pub(crate) next: usize,
+}
+
+impl PerfResults {
+    fn new() -> Self {
+        Self {
+            data: None,
+            next: 0
+        }
+    }
+    fn add(&mut self, result: StopWatchResult) {
+        if let Some(ref mut data) = &mut self.data {
+            if self.next < 100000 {
+                data[self.next] = result;
+                self.next += 1;
+            }
+        }
+    }
+}
+
+struct StopWatch {
+    tag: &'static str,
+    start: i64
+}
+
+impl StopWatch {
+    fn start(tag: &'static str) -> Self {
+        Self {
+            tag,
+            start: unsafe { kernel::bindings::ktime_get() },
+        }
+    }
+
+    fn stop(self) -> StopWatchResult {
+        StopWatchResult::new(self)
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+pub(crate) struct StopWatchResult {
+    pub(crate) tag: &'static str,
+    pub(crate) start: i64,
+    pub(crate) duration: i64,
+}
+
+impl StopWatchResult {
+    fn new(start: StopWatch) -> Self {
+        let StopWatch { tag, start } = start;
+        Self {
+            tag,
+            start,
+            duration: unsafe { kernel::bindings::ktime_get() } - start
         }
     }
 }

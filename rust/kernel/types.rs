@@ -344,6 +344,11 @@ impl<T: AlwaysRefCounted> ARef<T> {
             _p: PhantomData,
         }
     }
+
+    /// ptr_eq
+    pub fn ptr_eq(left: &ARef<T>, right: &ARef<T>) -> bool {
+        left.ptr == right.ptr
+    }
 }
 
 impl<T: AlwaysRefCounted> Clone for ARef<T> {

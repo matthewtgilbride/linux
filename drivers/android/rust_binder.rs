@@ -18,7 +18,7 @@ use kernel::{
     user_ptr::UserSlicePtrWriter,
 };
 
-use crate::{context::Context, process::Process, thread::Thread, transaction::Transaction};
+use crate::{context::Context, process::Process, thread::Thread, transaction::Transaction, range_alloc::StopWatchResult,};
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -238,6 +238,7 @@ unsafe extern "C" fn rust_binder_open(
     inode: *mut bindings::inode,
     file_ptr: *mut bindings::file,
 ) -> core::ffi::c_int {
+    pr_warn!("rust_binder_open");
     // SAFETY: The `rust_binderfs.c` file ensures that `i_private` is set to the return value of a
     // successful call to `rust_binder_new_device`.
     let ctx = unsafe { Arc::<Context>::borrow((*inode).i_private) };
@@ -359,7 +360,11 @@ unsafe extern "C" fn rust_binder_transactions_show(_: *mut seq_file) -> core::ff
 }
 
 #[no_mangle]
-unsafe extern "C" fn rust_binder_transaction_log_show(_: *mut seq_file) -> core::ffi::c_int {
+unsafe extern "C" fn rust_binder_transaction_log_show(ptr: *mut seq_file) -> core::ffi::c_int {
+    let m = unsafe { SeqFile::from_raw(ptr) };
+    if let Err(err) = rust_binder_transaction_log_show_impl(m) {
+        seq_print!(m, "failed to generate state: {:?}\n", err);
+    }
     0
 }
 
@@ -373,5 +378,73 @@ fn rust_binder_state_show_impl(m: &mut SeqFile) -> Result<()> {
             seq_print!(m, "\n");
         }
     }
+    Ok(())
+}
+
+fn rust_binder_transaction_log_show_impl(m: &mut SeqFile) -> Result<()> {
+    pr_warn!("rust_binder_transaction_log_show_impl");
+    use kernel::types::ARef;
+    use kernel::task::Task;
+    let current = kernel::current!();
+    let me_task: ARef<Task> = current.group_leader().into();
+    let mut me_proc = None;
+    {
+        let contexts = context::get_all_contexts()?;
+        'outer:
+        for ctx in contexts {
+            let procs = ctx.get_all_procs()?;
+            for proc in procs {
+                if ARef::ptr_eq(&me_task, &proc.task) {
+                    me_proc = Some(proc);
+                    break 'outer;
+                }
+            }
+        }
+    }
+
+    let proc = match me_proc {
+        Some(proc) => proc,
+        None => {
+            seq_print!(m, "No such process\n");
+            return Ok(());
+        },
+    };
+
+    pr_warn!("rust_binder_transaction_log_show_impl: found proc");
+
+    let mut inner = proc.inner.lock();
+    let mapping = match &inner.mapping {
+        Some(mapping) => mapping,
+        None => {
+            seq_print!(m, "No mapping\n");
+            return Ok(());
+        }
+    };
+
+    pr_warn!("rust_binder_transaction_log_show_impl: found mapping");
+
+    let perf_results = &mapping.alloc.perf_results;
+    let Some(ref data) = perf_results.data else {
+        pr_warn!("rust_binder_transaction_log_show_impl: no perf_results.data");
+        let b = match Box::<[StopWatchResult; 100000]>::try_new_zeroed() {
+            Ok(b) => unsafe { Box::from_raw(Box::into_raw(b).cast()) },
+            Err(_alloc) => {
+                seq_print!(m, "Failed to allocate {}\n", _alloc);
+                return Ok(());
+            },
+        };
+        inner.record_perf(b);
+        pr_warn!("rust_binder_transaction_log_show_impl: Enabling.");
+        seq_print!(m, "Enabled.\n");
+        return Ok(());
+    };
+
+    pr_warn!("rust_binder_transaction_log_show_impl: Printing.");
+
+    for i in 0..perf_results.next {
+        let datum = data[i];
+        seq_print!(m, "range_alloc perf:{},{},{}\n", datum.tag, datum.start, datum.duration);
+    }
+
     Ok(())
 }

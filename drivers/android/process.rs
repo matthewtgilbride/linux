@@ -763,7 +763,7 @@ impl Process {
         let alloc = range_alloc::ReserveNewBox::try_new()?;
         let mut inner = self.inner.lock();
         let mapping = inner.mapping.as_mut().ok_or_else(BinderError::new_dead)?;
-        let (offset, aptr) = mapping
+        let offset = mapping
             .alloc
             .reserve_new(size, is_oneway, from_pid, alloc)?;
 
@@ -772,7 +772,6 @@ impl Process {
             offset,
             size,
             mapping.address + offset,
-            aptr,
             mapping.alloc.oneway_spam_detected,
         );
         drop(inner);
@@ -805,13 +804,12 @@ impl Process {
         let mut inner = self.inner.lock();
         let mapping = inner.mapping.as_mut()?;
         let offset = ptr.checked_sub(mapping.address)?;
-        let (size, aptr, odata) = mapping.alloc.reserve_existing(offset).ok()?;
+        let (size, odata) = mapping.alloc.reserve_existing(offset).ok()?;
         let mut alloc = Allocation::new(
             self.clone(),
             offset,
             size,
             ptr,
-            aptr,
             mapping.alloc.oneway_spam_detected,
         );
         if let Some(data) = odata {
@@ -849,7 +847,7 @@ impl Process {
         }
     }
 
-    pub(crate) fn buffer_make_freeable(&self, offset: crate::range_alloc::AllocPtr<AllocationInfo>, data: Option<AllocationInfo>) {
+    pub(crate) fn buffer_make_freeable(&self, offset: usize, data: Option<AllocationInfo>) {
         let mut inner = self.inner.lock();
         if let Some(ref mut mapping) = &mut inner.mapping {
             if mapping.alloc.reservation_commit(offset, data).is_err() {
@@ -1080,10 +1078,10 @@ impl Process {
         if let Some(mut mapping) = omapping {
             let address = mapping.address;
             let oneway_spam_detected = mapping.alloc.oneway_spam_detected;
-            mapping.alloc.take_for_each(|offset, size, aptr, odata| {
+            mapping.alloc.take_for_each(|offset, size, odata| {
                 let ptr = offset + address;
                 let mut alloc =
-                    Allocation::new(self.clone(), offset, size, ptr, aptr, oneway_spam_detected);
+                    Allocation::new(self.clone(), offset, size, ptr, oneway_spam_detected);
                 if let Some(data) = odata {
                     alloc.set_info(data);
                 }

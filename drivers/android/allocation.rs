@@ -52,7 +52,6 @@ pub(crate) struct Allocation {
     pub(crate) process: Arc<Process>,
     allocation_info: Option<AllocationInfo>,
     free_on_drop: bool,
-    aptr: crate::range_alloc::AllocPtr<AllocationInfo>,
     pub(crate) oneway_spam_detected: bool,
 }
 
@@ -62,7 +61,6 @@ impl Allocation {
         offset: usize,
         size: usize,
         ptr: usize,
-        aptr: crate::range_alloc::AllocPtr<AllocationInfo>,
         oneway_spam_detected: bool,
     ) -> Self {
         Self {
@@ -70,7 +68,6 @@ impl Allocation {
             offset,
             size,
             ptr,
-            aptr,
             oneway_spam_detected,
             allocation_info: None,
             free_on_drop: true,
@@ -127,7 +124,7 @@ impl Allocation {
 
     pub(crate) fn keep_alive(mut self) {
         self.process
-            .buffer_make_freeable(self.aptr, self.allocation_info.take());
+            .buffer_make_freeable(self.offset, self.allocation_info.take());
         self.free_on_drop = false;
     }
 

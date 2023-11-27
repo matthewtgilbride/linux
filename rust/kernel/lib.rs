@@ -60,6 +60,7 @@ pub mod task;
 pub mod types;
 pub mod user_ptr;
 pub mod workqueue;
+pub mod xarray;
 
 #[doc(hidden)]
 pub use bindings;

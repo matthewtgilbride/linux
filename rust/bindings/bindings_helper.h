@@ -26,6 +26,7 @@
 #include <linux/shrinker.h>
 #include <linux/task_work.h>
 #include <linux/workqueue.h>
+#include <linux/xarray.h>
 #include <uapi/linux/android/binder.h>
 #include <uapi/linux/android/binderfs.h>
 #include <uapi/linux/sched/types.h>
@@ -35,3 +36,19 @@ const size_t BINDINGS_ARCH_SLAB_MINALIGN = ARCH_SLAB_MINALIGN;
 const gfp_t BINDINGS_GFP_KERNEL = GFP_KERNEL;
 const gfp_t BINDINGS___GFP_ZERO = __GFP_ZERO;
 const __poll_t BINDINGS_POLLFREE = POLLFREE;
+
+const gfp_t BINDINGS_XA_FLAGS_LOCK_IRQ = XA_FLAGS_LOCK_IRQ;
+const gfp_t BINDINGS_XA_FLAGS_LOCK_BH = XA_FLAGS_LOCK_BH;
+const gfp_t BINDINGS_XA_FLAGS_TRACK_FREE = XA_FLAGS_TRACK_FREE;
+const gfp_t BINDINGS_XA_FLAGS_ZERO_BUSY = XA_FLAGS_ZERO_BUSY;
+const gfp_t BINDINGS_XA_FLAGS_ALLOC_WRAPPED = XA_FLAGS_ALLOC_WRAPPED;
+const gfp_t BINDINGS_XA_FLAGS_ACCOUNT = XA_FLAGS_ACCOUNT;
+const gfp_t BINDINGS_XA_FLAGS_ALLOC = XA_FLAGS_ALLOC;
+const gfp_t BINDINGS_XA_FLAGS_ALLOC1 = XA_FLAGS_ALLOC1;
+
+const xa_mark_t BINDINGS_XA_MARK_0 = XA_MARK_0;
+const xa_mark_t BINDINGS_XA_MARK_1 = XA_MARK_1;
+const xa_mark_t BINDINGS_XA_MARK_2 = XA_MARK_2;
+const xa_mark_t BINDINGS_XA_PRESENT = XA_PRESENT;
+const xa_mark_t BINDINGS_XA_MARK_MAX = XA_MARK_MAX;
+const xa_mark_t BINDINGS_XA_FREE_MARK = XA_FREE_MARK;

@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0
+use core::mem::MaybeUninit;
 
 use kernel::{
     prelude::*,
     rbtree::{RBTree, RBTreeNode, RBTreeNodeReservation},
     task::Pid,
+    xarray::{flags::LOCK_IRQ, XArray},
 };
 
 /// Keeps track of allocations in a process' mmap.
@@ -11,8 +13,8 @@ use kernel::{
 /// Each process has an mmap where the data for incoming transactions will be placed. This struct
 /// keeps track of allocations made in the mmap. For each allocation, we store a descriptor that
 /// has metadata related to the allocation. We also keep track of available free space.
-pub(crate) struct RangeAllocator<T> {
-    tree: RBTree<usize, Descriptor<T>>,
+pub(crate) struct RangeAllocator<T: 'static> {
+    descriptors: Pin<Box<XArray<Box<Descriptor<T>>>>>,
     free_tree: RBTree<FreeKey, ()>,
     size: usize,
     free_oneway_space: usize,
@@ -42,13 +44,14 @@ impl FreedRange {
 
 impl<T> RangeAllocator<T> {
     pub(crate) fn new(size: usize) -> Result<Self> {
-        let mut tree = RBTree::new();
-        tree.try_create_and_insert(0, Descriptor::new(0, size))?;
+        let descriptors = Box::pin_init(XArray::<Box<Descriptor<T>>>::new(LOCK_IRQ))?;
+        let desc = Box::try_new(Descriptor::new(0, None, size))?;
+        descriptors.as_ref().set(0, desc)?;
         let mut free_tree = RBTree::new();
         free_tree.try_create_and_insert((size, 0), ())?;
         Ok(Self {
             free_oneway_space: size / 2,
-            tree,
+            descriptors,
             free_tree,
             oneway_spam_detected: false,
             perf_results: PerfResults::new(),
@@ -56,10 +59,10 @@ impl<T> RangeAllocator<T> {
         })
     }
 
-    fn find_best_match(&mut self, size: usize) -> Option<&mut Descriptor<T>> {
+    fn find_best_match(&mut self, size: usize) -> Option<usize> {
         let free_cursor = self.free_tree.cursor_lower_bound(&(size, 0))?;
         let ((_, offset), _) = free_cursor.current();
-        self.tree.get_mut(offset)
+        Some(*offset)
     }
 
     /// Try to reserve a new buffer, using the provided allocation if necessary.
@@ -91,30 +94,35 @@ impl<T> RangeAllocator<T> {
         self.oneway_spam_detected =
             is_oneway && new_oneway_space < self.size / 10 && self.low_oneway_space(pid);
 
-        let (found_size, found_off, tree_node, free_tree_node) = match self.find_best_match(size) {
-            None => {
-                pr_warn!("ENOSPC from range_alloc.reserve_new - size: {}", size);
-                return Err(ENOSPC);
-            }
-            Some(desc) => {
+        let Some(offset) = self.find_best_match(size) else {
+            pr_warn!("ENOSPC from range_alloc.reserve_new - size: {}", size);
+            return Err(ENOSPC);
+        };
+
+        let (found_size, found_off, new_desc, free_tree_node) =
+            self.descriptors.get_scoped(offset as u64, |desc| {
+                let desc = desc.unwrap();
                 let found_size = desc.size;
-                let found_offset = desc.offset;
+                let found_off = desc.offset;
 
                 // In case we need to break up the descriptor
-                let new_desc = Descriptor::new(found_offset + size, found_size - size);
-                let (tree_node, free_tree_node, desc_node_res) = alloc.initialize(new_desc);
+                let new_desc =
+                    Descriptor::new(found_off + size, Some(found_off), found_size - size);
+                let (new_desc, free_tree_node, desc_node_res) = alloc.initialize(new_desc);
 
                 desc.state = Some(DescriptorState::new(is_oneway, pid, desc_node_res));
                 desc.size = size;
 
-                (found_size, found_offset, tree_node, free_tree_node)
-            }
-        };
+                (found_size, found_off, new_desc, free_tree_node)
+            });
+
         self.free_oneway_space = new_oneway_space;
         self.free_tree.remove(&(found_size, found_off));
 
         if found_size != size {
-            self.tree.insert(tree_node);
+            self.descriptors
+                .as_ref()
+                .set(new_desc.offset as u64, new_desc)?;
             self.free_tree.insert(free_tree_node);
         }
 
@@ -126,47 +134,45 @@ impl<T> RangeAllocator<T> {
     pub(crate) fn reservation_abort(&mut self, offset: usize) -> Result<FreedRange> {
         let stop_watch = StopWatch::start("reservation_abort");
 
-        let mut cursor = self.tree.cursor_lower_bound(&offset).ok_or_else(|| {
-            pr_warn!(
-                "EINVAL from range_alloc.reservation_abort - offset: {}",
-                offset
-            );
-            EINVAL
-        })?;
+        let (prev_offset, next_offset, size, reservation) =
+            self.descriptors
+                .as_ref()
+                .get_scoped(offset as u64, |desc| {
+                    let Some(desc) = desc else {
+                        pr_warn!(
+                            "EINVAL from range_alloc.reservation_abort - offset: {}",
+                            offset
+                        );
+                        return Err(EINVAL);
+                    };
 
-        let (_, desc) = cursor.current_mut();
+                    let reservation = desc.try_change_state(|state| match state {
+                        Some(DescriptorState::Reserved(reservation)) => (None, Ok(reservation)),
+                        None => {
+                            pr_warn!(
+                                "EINVAL from range_alloc.reservation_abort - offset: {}",
+                                offset
+                            );
+                            (None, Err(EINVAL))
+                        }
+                        allocated => {
+                            pr_warn!(
+                                "EPERM from range_alloc.reservation_abort - offset: {}",
+                                offset
+                            );
+                            (allocated, Err(EPERM))
+                        }
+                    })?;
 
-        if desc.offset != offset {
-            pr_warn!(
-                "EINVAL from range_alloc.reservation_abort - offset: {}",
-                offset
-            );
-            return Err(EINVAL);
-        }
+                    let free_oneway_space_add = if reservation.is_oneway { desc.size } else { 0 };
 
-        let reservation = desc.try_change_state(|state| match state {
-            Some(DescriptorState::Reserved(reservation)) => (None, Ok(reservation)),
-            None => {
-                pr_warn!(
-                    "EINVAL from range_alloc.reservation_abort - offset: {}",
-                    offset
-                );
-                (None, Err(EINVAL))
-            }
-            allocated => {
-                pr_warn!(
-                    "EPERM from range_alloc.reservation_abort - offset: {}",
-                    offset
-                );
-                (allocated, Err(EPERM))
-            }
-        })?;
+                    self.free_oneway_space += free_oneway_space_add;
 
-        let mut size = desc.size;
-        let mut offset = desc.offset;
-        let free_oneway_space_add = if reservation.is_oneway { size } else { 0 };
+                    Ok((desc.prev_offset, desc.next_offset(), desc.size, reservation))
+                })?;
 
-        self.free_oneway_space += free_oneway_space_add;
+        let mut size = size;
+        let mut offset = offset;
 
         let mut freed_range = FreedRange::interior_pages(offset, size);
         // Compute how large the next free region needs to be to include one more page in
@@ -183,38 +189,59 @@ impl<T> RangeAllocator<T> {
         };
 
         // Merge next into current if next is free
-        let remove_next = match cursor.peek_next() {
-            Some((_, next)) if next.state.is_none() => {
-                if next.size >= add_next_page_needed {
-                    freed_range.end_page_idx += 1;
-                }
-                self.free_tree.remove(&(next.size, next.offset));
-                size += next.size;
-                true
-            }
-            _ => false,
-        };
+        let remove_next =
+            self.descriptors
+                .as_ref()
+                .get_scoped(next_offset as u64, |next| match next {
+                    Some(next) if next.state.is_none() => {
+                        if next.size >= add_next_page_needed {
+                            freed_range.end_page_idx += 1;
+                        }
+                        self.free_tree.remove(&(next.size, next.offset));
+                        size += next.size;
+                        true
+                    }
+                    _ => false,
+                });
 
         if remove_next {
-            let (_, desc) = cursor.current_mut();
-            desc.size = size;
-            cursor.remove_next();
+            // update current size with new size
+            self.descriptors.as_ref().get_scoped(offset as u64, |desc| {
+                if let Some(desc) = desc {
+                    desc.size = size;
+                }
+            });
+            // remove next
+            self.descriptors.as_ref().remove(next_offset as u64);
         }
 
         // Merge current into prev if prev is free
-        match cursor.peek_prev_mut() {
-            Some((_, prev)) if prev.state.is_none() => {
-                if prev.size >= add_prev_page_needed {
-                    freed_range.start_page_idx -= 1;
-                }
-                // merge previous with current, remove current
-                self.free_tree.remove(&(prev.size, prev.offset));
-                offset = prev.offset;
-                size += prev.size;
-                prev.size = size;
-                cursor.remove_current();
-            }
-            _ => {}
+        let remove_current = if let Some(prev_offset) = prev_offset {
+            self.descriptors
+                .as_ref()
+                .get_scoped(prev_offset as u64, |prev| match prev {
+                    Some(prev) if prev.state.is_none() => {
+                        if prev.size >= add_prev_page_needed {
+                            freed_range.start_page_idx -= 1;
+                        }
+                        self.free_tree.remove(&(prev.size, prev.offset));
+                        let result = Some(offset);
+                        size += prev.size;
+                        // returned offset is now previous offset
+                        offset = prev.offset;
+                        // update prev size with new size
+                        prev.size = size;
+                        result
+                    }
+                    _ => None,
+                })
+        } else {
+            None
+        };
+
+        // remove current if prev was free
+        if let Some(remove_current) = remove_current {
+            self.descriptors.as_ref().remove(remove_current as u64);
         };
 
         self.free_tree
@@ -228,26 +255,28 @@ impl<T> RangeAllocator<T> {
     pub(crate) fn reservation_commit(&mut self, offset: usize, data: Option<T>) -> Result {
         let stop_watch = StopWatch::start("reservation_commit");
         
-        let desc = self.tree.get_mut(&offset).ok_or_else(|| {
-            pr_warn!(
-                "ENOENT from range_alloc.reservation_commit - offset: {}",
-                offset
-            );
-            ENOENT
-        })?;
+        self.descriptors.as_ref().get_scoped(offset as u64, |desc| {
+            let Some(desc) = desc else {
+                    pr_warn!(
+                        "ENOENT from range_alloc.reservation_commit - offset: {}",
+                        offset
+                    );
+                    return Err(ENOENT);
+                };
 
-        desc.try_change_state(|state| match state {
-            Some(DescriptorState::Reserved(reservation)) => (
-                Some(DescriptorState::Allocated(reservation.allocate(data))),
-                Ok(()),
-            ),
-            other => {
-                pr_warn!(
-                    "ENOENT from range_alloc.reservation_commit - offset: {}",
-                    offset
-                );
-                (other, Err(ENOENT))
-            }
+            desc.try_change_state(|state| match state {
+                Some(DescriptorState::Reserved(reservation)) => (
+                    Some(DescriptorState::Allocated(reservation.allocate(data))),
+                    Ok(()),
+                ),
+                other => {
+                    pr_warn!(
+                        "ENOENT from range_alloc.reservation_commit - offset: {}",
+                        offset
+                    );
+                    (other, Err(ENOENT))
+                }
+            })
         })?;
 
         self.perf_results.add(stop_watch.stop());
@@ -262,41 +291,53 @@ impl<T> RangeAllocator<T> {
     pub(crate) fn reserve_existing(&mut self, offset: usize) -> Result<(usize, Option<T>)> {
         let stop_watch = StopWatch::start("reserve_existing");
         
-        let desc = self.tree.get_mut(&offset).ok_or_else(|| {
-            pr_warn!(
-                "ENOENT from range_alloc.reserve_existing - offset: {}",
-                offset
-            );
-            ENOENT
-        })?;
+        let result = self.descriptors.as_ref().get_scoped(offset as u64, |desc| {
+            let Some(desc) = desc else {
+                    pr_warn!(
+                        "ENOENT from range_alloc.reserve_existing - offset: {}",
+                        offset
+                    );
+                    return Err(ENOENT)
+                };
 
-        let data = desc.try_change_state(|state| match state {
-            Some(DescriptorState::Allocated(allocation)) => {
-                let (reservation, data) = allocation.deallocate();
-                (Some(DescriptorState::Reserved(reservation)), Ok(data))
-            }
-            other => {
-                pr_warn!(
-                    "ENOENT from range_alloc.reserve_existing - offset: {}",
-                    offset
-                );
-                (other, Err(ENOENT))
-            }
+            let data = desc.try_change_state(|state| match state {
+                Some(DescriptorState::Allocated(allocation)) => {
+                    let (reservation, data) = allocation.deallocate();
+                    (Some(DescriptorState::Reserved(reservation)), Ok(data))
+                }
+                other => {
+                    pr_warn!(
+                        "ENOENT from range_alloc.reserve_existing - offset: {}",
+                        offset
+                    );
+                    (other, Err(ENOENT))
+                }
+            })?;
+
+            Ok((desc.size, data))
         })?;
 
         self.perf_results.add(stop_watch.stop());
 
-        Ok((desc.size, data))
+        Ok(result)
     }
 
     /// Call the provided callback at every allocated region.
     ///
     /// This destroys the range allocator. Used only during shutdown.
     pub(crate) fn take_for_each<F: Fn(usize, usize, Option<T>)>(&mut self, callback: F) {
-        for (_, desc) in self.tree.iter_mut() {
-            if let Some(DescriptorState::Allocated(allocation)) = &mut desc.state {
-                callback(desc.offset, desc.size, allocation.take());
-            }
+        let mut index = 0;
+        while let Some(new_index) = self.descriptors.find(index) {
+            self.descriptors.get_scoped(new_index, |desc| {
+                if let Some(desc) = desc {
+                    if let Some(state) = &mut desc.state {
+                        if let DescriptorState::Allocated(ref mut allocation) = state {
+                            callback(desc.offset, desc.size, allocation.take());
+                        }
+                    }
+                }
+            });
+            index = new_index + 1;
         }
     }
 
@@ -309,13 +350,19 @@ impl<T> RangeAllocator<T> {
     fn low_oneway_space(&self, calling_pid: Pid) -> bool {
         let mut total_alloc_size = 0;
         let mut num_buffers = 0;
-        for (_, desc) in self.tree.iter() {
-            if let Some(state) = &desc.state {
-                if state.is_oneway() && state.pid() == calling_pid {
-                    total_alloc_size += desc.size;
-                    num_buffers += 1;
+        let mut index = 0;
+        while let Some(new_index) = self.descriptors.find(index) {
+            self.descriptors.get_scoped(new_index, |desc| {
+                if let Some(desc) = desc {
+                    if let Some(state) = &desc.state {
+                        if state.is_oneway() && state.pid() == calling_pid {
+                            total_alloc_size += desc.size;
+                            num_buffers += 1;
+                        }
+                    }
                 }
-            }
+            });
+            index = new_index + 1;
         }
 
         // Warn if this pid has more than 50 transactions, or more than 50% of
@@ -333,16 +380,22 @@ impl<T> RangeAllocator<T> {
 struct Descriptor<T> {
     size: usize,
     offset: usize,
+    prev_offset: Option<usize>,
     state: Option<DescriptorState<T>>,
 }
 
 impl<T> Descriptor<T> {
-    fn new(offset: usize, size: usize) -> Self {
+    fn new(offset: usize, prev_offset: Option<usize>, size: usize) -> Self {
         Self {
             size,
             offset,
+            prev_offset,
             state: None,
         }
+    }
+
+    fn next_offset(&self) -> usize {
+        self.size + self.offset
     }
 
     fn try_change_state<F, Data>(&mut self, f: F) -> Result<Data>
@@ -431,18 +484,18 @@ type FreeNodeRes = RBTreeNodeReservation<FreeKey, ()>;
 
 /// An allocation for use by `reserve_new`.
 pub(crate) struct ReserveNewBox<T> {
-    tree_node_res: RBTreeNodeReservation<usize, Descriptor<T>>,
+    desc: Box<MaybeUninit<Descriptor<T>>>,
     free_tree_node_res: FreeNodeRes,
     desc_node_res: FreeNodeRes,
 }
 
 impl<T> ReserveNewBox<T> {
     pub(crate) fn try_new() -> Result<Self> {
-        let tree_node_res = RBTree::try_reserve_node()?;
+        let desc = Box::try_new_uninit()?;
         let free_tree_node_res = RBTree::try_reserve_node()?;
         let desc_node_res = RBTree::try_reserve_node()?;
         Ok(Self {
-            tree_node_res,
+            desc,
             free_tree_node_res,
             desc_node_res,
         })
@@ -451,15 +504,11 @@ impl<T> ReserveNewBox<T> {
     fn initialize(
         self,
         desc: Descriptor<T>,
-    ) -> (
-        RBTreeNode<usize, Descriptor<T>>,
-        RBTreeNode<FreeKey, ()>,
-        FreeNodeRes,
-    ) {
+    ) -> (Box<Descriptor<T>>, RBTreeNode<FreeKey, ()>, FreeNodeRes) {
         let size = desc.size;
         let offset = desc.offset;
         (
-            self.tree_node_res.into_node(offset, desc),
+            Box::write(self.desc, desc),
             self.free_tree_node_res.into_node((size, offset), ()),
             self.desc_node_res,
         )

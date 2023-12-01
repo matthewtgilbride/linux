@@ -18,7 +18,7 @@ use kernel::{
     user_ptr::UserSlicePtrWriter,
 };
 
-use crate::{context::Context, process::Process, thread::Thread, transaction::Transaction, range_alloc::StopWatchResult,};
+use crate::{context::Context, process::Process, thread::Thread, transaction::Transaction,};
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -30,6 +30,8 @@ mod node;
 mod prio;
 mod process;
 mod range_alloc;
+#[allow(dead_code)]
+mod range_alloc_test;
 mod thread;
 mod transaction;
 
@@ -385,6 +387,7 @@ fn rust_binder_transaction_log_show_impl(m: &mut SeqFile) -> Result<()> {
     pr_warn!("rust_binder_transaction_log_show_impl");
     use kernel::types::ARef;
     use kernel::task::Task;
+    use crate::range_alloc_test::tests;
     let current = kernel::current!();
     let me_task: ARef<Task> = current.group_leader().into();
     let mut me_proc = None;
@@ -402,7 +405,7 @@ fn rust_binder_transaction_log_show_impl(m: &mut SeqFile) -> Result<()> {
         }
     }
 
-    let proc = match me_proc {
+    match me_proc {
         Some(proc) => proc,
         None => {
             seq_print!(m, "No such process\n");
@@ -410,41 +413,9 @@ fn rust_binder_transaction_log_show_impl(m: &mut SeqFile) -> Result<()> {
         },
     };
 
-    pr_warn!("rust_binder_transaction_log_show_impl: found proc");
+    tests::run();
 
-    let mut inner = proc.inner.lock();
-    let mapping = match &inner.mapping {
-        Some(mapping) => mapping,
-        None => {
-            seq_print!(m, "No mapping\n");
-            return Ok(());
-        }
-    };
-
-    pr_warn!("rust_binder_transaction_log_show_impl: found mapping");
-
-    let perf_results = &mapping.alloc.perf_results;
-    let Some(ref data) = perf_results.data else {
-        pr_warn!("rust_binder_transaction_log_show_impl: no perf_results.data");
-        let b = match Box::<[StopWatchResult; 100000]>::try_new_zeroed() {
-            Ok(b) => unsafe { Box::from_raw(Box::into_raw(b).cast()) },
-            Err(_alloc) => {
-                seq_print!(m, "Failed to allocate {}\n", _alloc);
-                return Ok(());
-            },
-        };
-        inner.record_perf(b);
-        pr_warn!("rust_binder_transaction_log_show_impl: Enabling.");
-        seq_print!(m, "Enabled.\n");
-        return Ok(());
-    };
-
-    pr_warn!("rust_binder_transaction_log_show_impl: Printing.");
-
-    for i in 0..perf_results.next {
-        let datum = data[i];
-        seq_print!(m, "range_alloc perf:{},{},{}\n", datum.tag, datum.start, datum.duration);
-    }
+    seq_print!(m, "range_alloc test: OK!\n");
 
     Ok(())
 }

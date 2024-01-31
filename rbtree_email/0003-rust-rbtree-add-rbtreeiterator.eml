@@ -1,0 +1,239 @@
+From: Matt Gilbride <mattgilbride@google.com>
+Date: Wed, 31 Jan 2024 12:43:46 +0000
+Subject: [PATCH 3/6] rust: rbtree: add `RBTreeIterator`
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 7bit
+Message-Id: <20240131-b4-rbtree-v1-3-b5b4373019a1@google.com>
+References: <20240131-b4-rbtree-v1-0-b5b4373019a1@google.com>
+In-Reply-To: <20240131-b4-rbtree-v1-0-b5b4373019a1@google.com>
+To: Miguel Ojeda <ojeda@kernel.org>, Alex Gaynor <alex.gaynor@gmail.com>, 
+ Wedson Almeida Filho <wedsonaf@gmail.com>, 
+ Boqun Feng <boqun.feng@gmail.com>, Gary Guo <gary@garyguo.net>, 
+ =?utf-8?q?Bj=C3=B6rn_Roy_Baron?= <bjorn3_gh@protonmail.com>, 
+ Benno Lossin <benno.lossin@proton.me>, 
+ Andreas Hindborg <a.hindborg@samsung.com>, 
+ Alice Ryhl <aliceryhl@google.com>, 
+ Greg Kroah-Hartman <gregkh@linuxfoundation.org>, 
+ =?utf-8?q?Arve_Hj=C3=B8nnev=C3=A5g?= <arve@android.com>, 
+ Todd Kjos <tkjos@android.com>, Martijn Coenen <maco@android.com>, 
+ Joel Fernandes <joel@joelfernandes.org>, 
+ Carlos Llamas <cmllamas@google.com>, Suren Baghdasaryan <surenb@google.com>, 
+ Christian Brauner <brauner@kernel.org>
+Cc: Rob Landley <rob@landley.net>, Davidlohr Bueso <dave@stgolabs.net>, 
+ Michel Lespinasse <michel@lespinasse.org>, rust-for-linux@vger.kernel.org, 
+ linux-kernel@vger.kernel.org, Matt Gilbride <mattgilbride@google.com>
+X-Mailer: b4 0.12.3
+
+From: Wedson Almeida Filho <wedsonaf@gmail.com>
+
+- Add Iterator implementation (`RBTreeIterator`) for `RBTree`, allowing
+  iteration over (key, value) pairs in key order.
+- Add individual `keys()` and `values()` functions to iterate over keys
+  or values alone.
+- Update doctests to use iteration instead of explicitly getting items.
+
+Iteration is needed by the binder driver to enumerate all values in a
+tree for oneway spam detection [1].
+
+Link: https://lore.kernel.org/rust-for-linux/20231101-rust-binder-v1-17-08ba9197f637@google.com/ [1]
+Signed-off-by: Wedson Almeida Filho <wedsonaf@gmail.com>
+Signed-off-by: Matt Gilbride <mattgilbride@google.com>
+---
+ rust/kernel/rbtree.rs | 125 ++++++++++++++++++++++++++++++++++++++++++--------
+ 1 file changed, 107 insertions(+), 18 deletions(-)
+
+diff --git a/rust/kernel/rbtree.rs b/rust/kernel/rbtree.rs
+index 18ee20c38ec2..80a86779c087 100644
+--- a/rust/kernel/rbtree.rs
++++ b/rust/kernel/rbtree.rs
+@@ -53,14 +53,30 @@ struct Node<K, V> {
+ ///     assert_eq!(tree.get(&30).unwrap(), &300);
+ /// }
+ ///
++/// // Iterate over the nodes we just inserted.
++/// {
++///     let mut iter = tree.iter();
++///     assert_eq!(iter.next().unwrap(), (&10, &100));
++///     assert_eq!(iter.next().unwrap(), (&20, &200));
++///     assert_eq!(iter.next().unwrap(), (&30, &300));
++///     assert!(iter.next().is_none());
++/// }
++///
++/// // Print all elements.
++/// for (key, value) in &tree {
++///     pr_info!("{} = {}\n", key, value);
++/// }
++///
+ /// // Replace one of the elements.
+ /// tree.try_create_and_insert(10, 1000)?;
+ ///
+ /// // Check that the tree reflects the replacement.
+ /// {
+-///     assert_eq!(tree.get(&10).unwrap(), &1000);
+-///     assert_eq!(tree.get(&20).unwrap(), &200);
+-///     assert_eq!(tree.get(&30).unwrap(), &300);
++///     let mut iter = tree.iter();
++///     assert_eq!(iter.next().unwrap(), (&10, &1000));
++///     assert_eq!(iter.next().unwrap(), (&20, &200));
++///     assert_eq!(iter.next().unwrap(), (&30, &300));
++///     assert!(iter.next().is_none());
+ /// }
+ ///
+ /// // Change the value of one of the elements.
+@@ -68,9 +84,11 @@ struct Node<K, V> {
+ ///
+ /// // Check that the tree reflects the update.
+ /// {
+-///     assert_eq!(tree.get(&10).unwrap(), &1000);
+-///     assert_eq!(tree.get(&20).unwrap(), &200);
+-///     assert_eq!(tree.get(&30).unwrap(), &3000);
++///     let mut iter = tree.iter();
++///     assert_eq!(iter.next().unwrap(), (&10, &1000));
++///     assert_eq!(iter.next().unwrap(), (&20, &200));
++///     assert_eq!(iter.next().unwrap(), (&30, &3000));
++///     assert!(iter.next().is_none());
+ /// }
+ ///
+ /// // Remove an element.
+@@ -78,9 +96,10 @@ struct Node<K, V> {
+ ///
+ /// // Check that the tree reflects the removal.
+ /// {
+-///     assert_eq!(tree.get(&10), None);
+-///     assert_eq!(tree.get(&20).unwrap(), &200);
+-///     assert_eq!(tree.get(&30).unwrap(), &3000);
++///     let mut iter = tree.iter();
++///     assert_eq!(iter.next().unwrap(), (&20, &200));
++///     assert_eq!(iter.next().unwrap(), (&30, &3000));
++///     assert!(iter.next().is_none());
+ /// }
+ ///
+ /// # Ok::<(), Error>(())
+@@ -120,9 +139,11 @@ struct Node<K, V> {
+ ///
+ /// // Check the nodes we just inserted.
+ /// {
+-///     assert_eq!(tree.get(&10).unwrap(), &100);
+-///     assert_eq!(tree.get(&20).unwrap(), &200);
+-///     assert_eq!(tree.get(&30).unwrap(), &300);
++///     let mut iter = tree.iter();
++///     assert_eq!(iter.next().unwrap(), (&10, &100));
++///     assert_eq!(iter.next().unwrap(), (&20, &200));
++///     assert_eq!(iter.next().unwrap(), (&30, &300));
++///     assert!(iter.next().is_none());
+ /// }
+ ///
+ /// // Remove a node, getting back ownership of it.
+@@ -130,9 +151,10 @@ struct Node<K, V> {
+ ///
+ /// // Check that the tree reflects the removal.
+ /// {
+-///     assert_eq!(tree.get(&10).unwrap(), &100);
+-///     assert_eq!(tree.get(&20).unwrap(), &200);
+-///     assert_eq!(tree.get(&30), None);
++///     let mut iter = tree.iter();
++///     assert_eq!(iter.next().unwrap(), (&10, &100));
++///     assert_eq!(iter.next().unwrap(), (&20, &200));
++///     assert!(iter.next().is_none());
+ /// }
+ ///
+ /// // Turn the node into a reservation so that we can reuse it with a different key/value.
+@@ -144,9 +166,11 @@ struct Node<K, V> {
+ ///
+ /// // Check that the tree reflect the new insertion.
+ /// {
+-///     assert_eq!(tree.get(&10).unwrap(), &100);
+-///     assert_eq!(tree.get(&15).unwrap(), &150);
+-///     assert_eq!(tree.get(&20).unwrap(), &200);
++///     let mut iter = tree.iter();
++///     assert_eq!(iter.next().unwrap(), (&10, &100));
++///     assert_eq!(iter.next().unwrap(), (&15, &150));
++///     assert_eq!(iter.next().unwrap(), (&20, &200));
++///     assert!(iter.next().is_none());
+ /// }
+ ///
+ /// # Ok::<(), Error>(())
+@@ -187,6 +211,25 @@ pub fn try_reserve_node() -> Result<RBTreeNodeReservation<K, V>> {
+     pub fn try_allocate_node(key: K, value: V) -> Result<RBTreeNode<K, V>> {
+         Ok(Self::try_reserve_node()?.into_node(key, value))
+     }
++
++    /// Returns an iterator over the tree nodes, sorted by key.
++    pub fn iter(&self) -> RBTreeIterator<'_, K, V> {
++        RBTreeIterator {
++            _tree: PhantomData,
++            // SAFETY: `root` is valid as it's embedded in `self` and we have a valid `self`.
++            next: unsafe { bindings::rb_first(&self.root) },
++        }
++    }
++
++    /// Returns an iterator over the keys of the nodes in the tree, in sorted order.
++    pub fn keys(&self) -> impl Iterator<Item = &'_ K> {
++        self.iter().map(|(k, _)| k)
++    }
++
++    /// Returns an iterator over the values of the nodes in the tree, sorted by key.
++    pub fn values(&self) -> impl Iterator<Item = &'_ V> {
++        self.iter().map(|(_, v)| v)
++    }
+ }
+ 
+ impl<K, V> RBTree<K, V>
+@@ -349,6 +392,52 @@ fn drop(&mut self) {
+     }
+ }
+ 
++impl<'a, K, V> IntoIterator for &'a RBTree<K, V> {
++    type Item = (&'a K, &'a V);
++    type IntoIter = RBTreeIterator<'a, K, V>;
++
++    fn into_iter(self) -> Self::IntoIter {
++        self.iter()
++    }
++}
++
++/// An iterator over the nodes of a [`RBTree`].
++///
++/// Instances are created by calling [`RBTree::iter`].
++pub struct RBTreeIterator<'a, K, V> {
++    _tree: PhantomData<&'a RBTree<K, V>>,
++    next: *mut bindings::rb_node,
++}
++
++// SAFETY: An [`RBTree`] allows the same kinds of access to its values that a struct allows to its
++// fields, so we use the same Send condition as would be used for a struct with K and V fields.
++unsafe impl<'a, K: Send, V: Send> Send for RBTreeIterator<'a, K, V> {}
++
++// SAFETY: An [`RBTree`] allows the same kinds of access to its values that a struct allows to its
++// fields, so we use the same Sync condition as would be used for a struct with K and V fields.
++unsafe impl<'a, K: Sync, V: Sync> Sync for RBTreeIterator<'a, K, V> {}
++
++impl<'a, K, V> Iterator for RBTreeIterator<'a, K, V> {
++    type Item = (&'a K, &'a V);
++
++    fn next(&mut self) -> Option<Self::Item> {
++        if self.next.is_null() {
++            return None;
++        }
++
++        // SAFETY: All links fields we create are in a `Node<K, V>`.
++        let cur = unsafe { crate::container_of!(self.next, Node<K, V>, links) };
++
++        // SAFETY: The reference to the tree used to create the iterator outlives the iterator, so
++        // the tree cannot change. By the tree invariant, all nodes are valid.
++        self.next = unsafe { bindings::rb_next(self.next) };
++
++        // SAFETY: By the same reasoning above, it is safe to dereference the node. Additionally,
++        // it is ok to return a reference to members because the iterator must outlive it.
++        Some(unsafe { (&(*cur).key, &(*cur).value) })
++    }
++}
++
+ /// A memory reservation for a red-black tree node.
+ ///
+ /// It contains the memory needed to hold a node that can be inserted into a red-black tree. One
+
+-- 
+2.43.0.429.g432eaa2c6b-goog
+

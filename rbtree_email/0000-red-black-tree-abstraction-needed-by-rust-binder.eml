@@ -1,0 +1,95 @@
+From: Matt Gilbride <mattgilbride@google.com>
+Subject: [PATCH 0/6] Red-black tree abstraction needed by Rust Binder
+Date: Wed, 31 Jan 2024 12:43:43 +0000
+Message-Id: <20240131-b4-rbtree-v1-0-b5b4373019a1@google.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 7bit
+X-B4-Tracking: v=1; b=H4sIAH9AumUC/6tWKk4tykwtVrJSqFYqSi3LLM7MzwNyDHUUlJIzE
+ vPSU3UzU4B8JSMDI2NDIwNT3SQT3aKkkqLUVN3EpCTDRANDszSDRAMloPqCotS0zAqwWdGxtbU
+ A8SvFcFsAAAA=
+To: Miguel Ojeda <ojeda@kernel.org>, Alex Gaynor <alex.gaynor@gmail.com>, 
+ Wedson Almeida Filho <wedsonaf@gmail.com>, 
+ Boqun Feng <boqun.feng@gmail.com>, Gary Guo <gary@garyguo.net>, 
+ =?utf-8?q?Bj=C3=B6rn_Roy_Baron?= <bjorn3_gh@protonmail.com>, 
+ Benno Lossin <benno.lossin@proton.me>, 
+ Andreas Hindborg <a.hindborg@samsung.com>, 
+ Alice Ryhl <aliceryhl@google.com>, 
+ Greg Kroah-Hartman <gregkh@linuxfoundation.org>, 
+ =?utf-8?q?Arve_Hj=C3=B8nnev=C3=A5g?= <arve@android.com>, 
+ Todd Kjos <tkjos@android.com>, Martijn Coenen <maco@android.com>, 
+ Joel Fernandes <joel@joelfernandes.org>, 
+ Carlos Llamas <cmllamas@google.com>, Suren Baghdasaryan <surenb@google.com>, 
+ Christian Brauner <brauner@kernel.org>
+Cc: Rob Landley <rob@landley.net>, Davidlohr Bueso <dave@stgolabs.net>, 
+ Michel Lespinasse <michel@lespinasse.org>, rust-for-linux@vger.kernel.org, 
+ linux-kernel@vger.kernel.org, Matt Gilbride <mattgilbride@google.com>, 
+ Matt Gilbride <mattgilbride@gmail.com>
+X-Mailer: b4 0.12.3
+
+This patchset contains the red-black tree abstractions needed by the Rust
+implementation of the Binder driver.
+
+Binder driver benefits from O(log n) search/insertion/deletion of
+key/value mappings in various places, including `process.rs` and
+`range_alloc.rs`.  In `range_alloc.rs`, the ability to store and
+search by a generic key type is also useful.
+
+Please see the Rust Binder RFC for usage examples [1]. Note that
+the `container_of` macro is currently used only by `rbtree` itself.
+
+Users of "rust: rbtree: add red-black tree implementation backed by the C version"
+    [PATCH RFC 03/20] rust_binder: add threading support
+    [PATCH RFC 05/20] rust_binder: add nodes and context managers
+    [PATCH RFC 06/20] rust_binder: add oneway transactions
+
+Users of "rust: rbtree: add `RBTreeIterator`"
+    [PATCH RFC 17/20] rust_binder: add oneway spam detection
+
+Users of "rust: rbtree: add `RBTreeIteratorMut`"
+    [PATCH RFC 06/20] rust_binder: add oneway transactions
+
+Users of "rust: rbtree: add `RBTreeCursor`"
+    [PATCH RFC 06/20] rust_binder: add oneway transactions
+
+Users of "rust: rbtree: add RBTree::entry"
+    Not used in the original RFC, but introduced after further
+    code review.  See: https://r.android.com/2849906
+
+The Rust Binder RFC addresses the upstream deprecation of red-black
+tree. Quoted here for convenience:
+
+"This RFC uses the kernel's red-black tree for key/value mappings, but we
+are aware that the red-black tree is deprecated. We did this to make the
+performance comparison more fair, since C binder also uses rbtree for
+this. We intend to replace these with XArrays instead. That said, we
+don't think that XArray is a good fit for the range allocator, and we
+propose to continue using the red-black tree for the range allocator."
+
+Link: https://lore.kernel.org/rust-for-linux/20231101-rust-binder-v1-0-08ba9197f637@google.com/ [1]
+Signed-off-by: Matt Gilbride <mattgilbride@google.com>
+---
+Alice Ryhl (1):
+      rust: rbtree: add `RBTree::entry`
+
+Matt Gilbride (1):
+      rust: rbtree: add `RBTreeCursor`
+
+Wedson Almeida Filho (4):
+      rust: add `container_of!` macro
+      rust: rbtree: add red-black tree implementation backed by the C version
+      rust: rbtree: add `RBTreeIterator`
+      rust: rbtree: add `RBTreeIteratorMut`
+
+ rust/helpers.c        |    7 +
+ rust/kernel/lib.rs    |   33 ++
+ rust/kernel/rbtree.rs | 1215 +++++++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 1255 insertions(+)
+---
+base-commit: 41bccc98fb7931d63d03f326a746ac4d429c1dd3
+change-id: 20231205-b4-rbtree-abb1a016f0a0
+
+Best regards,
+-- 
+Matt Gilbride <mattgilbride@google.com>
+

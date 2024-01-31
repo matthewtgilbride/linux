@@ -1,0 +1,84 @@
+From: Matt Gilbride <mattgilbride@google.com>
+Date: Sun, 18 Feb 2024 15:03:45 +0000
+Subject: [PATCH v2 1/6] rust: add `container_of!` macro
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 7bit
+Message-Id: <20240218-b4-rbtree-v2-1-79d532c3bbf6@google.com>
+References: <20240218-b4-rbtree-v2-0-79d532c3bbf6@google.com>
+In-Reply-To: <20240218-b4-rbtree-v2-0-79d532c3bbf6@google.com>
+To: Miguel Ojeda <ojeda@kernel.org>, Alex Gaynor <alex.gaynor@gmail.com>, 
+ Wedson Almeida Filho <wedsonaf@gmail.com>, 
+ Boqun Feng <boqun.feng@gmail.com>, Gary Guo <gary@garyguo.net>, 
+ =?utf-8?q?Bj=C3=B6rn_Roy_Baron?= <bjorn3_gh@protonmail.com>, 
+ Benno Lossin <benno.lossin@proton.me>, 
+ Andreas Hindborg <a.hindborg@samsung.com>, 
+ Alice Ryhl <aliceryhl@google.com>, 
+ Greg Kroah-Hartman <gregkh@linuxfoundation.org>, 
+ =?utf-8?q?Arve_Hj=C3=B8nnev=C3=A5g?= <arve@android.com>, 
+ Todd Kjos <tkjos@android.com>, Martijn Coenen <maco@android.com>, 
+ Joel Fernandes <joel@joelfernandes.org>, 
+ Carlos Llamas <cmllamas@google.com>, Suren Baghdasaryan <surenb@google.com>, 
+ Christian Brauner <brauner@kernel.org>
+Cc: Rob Landley <rob@landley.net>, Davidlohr Bueso <dave@stgolabs.net>, 
+ Michel Lespinasse <michel@lespinasse.org>, rust-for-linux@vger.kernel.org, 
+ linux-kernel@vger.kernel.org, Matt Gilbride <mattgilbride@google.com>
+X-Mailer: b4 0.12.4
+
+From: Wedson Almeida Filho <wedsonaf@gmail.com>
+
+This macro is used to obtain a pointer to an entire struct
+when given a pointer to a field in that struct.
+
+Signed-off-by: Wedson Almeida Filho <wedsonaf@gmail.com>
+Reviewed-by: Alice Ryhl <aliceryhl@google.com>
+Tested-by: Alice Ryhl <aliceryhl@google.com>
+Signed-off-by: Matt Gilbride <mattgilbride@google.com>
+---
+ rust/kernel/lib.rs | 32 ++++++++++++++++++++++++++++++++
+ 1 file changed, 32 insertions(+)
+
+diff --git a/rust/kernel/lib.rs b/rust/kernel/lib.rs
+index 7ac39874aeac..c7963efd1318 100644
+--- a/rust/kernel/lib.rs
++++ b/rust/kernel/lib.rs
+@@ -102,3 +102,35 @@ fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
+     // SAFETY: FFI call.
+     unsafe { bindings::BUG() };
+ }
++
++/// Produces a pointer to an object from a pointer to one of its fields.
++///
++/// # Safety
++///
++/// The pointer passed to this macro, and the pointer returned by this macro, must both be in
++/// bounds of the same allocation.
++///
++/// # Examples
++///
++/// ```
++/// # use kernel::container_of;
++/// struct Test {
++///     a: u64,
++///     b: u32,
++/// }
++///
++/// let test = Test { a: 10, b: 20 };
++/// let b_ptr = &test.b;
++/// // SAFETY: The pointer points at the `b` field of a `Test`, so the resulting pointer will be
++/// // in-bounds of the same allocation as `b_ptr`.
++/// let test_alias = unsafe { container_of!(b_ptr, Test, b) };
++/// assert!(core::ptr::eq(&test, test_alias));
++/// ```
++#[macro_export]
++macro_rules! container_of {
++    ($ptr:expr, $type:ty, $($f:tt)*) => {{
++        let ptr = $ptr as *const _ as *const u8;
++        let offset: usize = ::core::mem::offset_of!($type, $($f)*);
++        ptr.sub(offset) as *const $type
++    }}
++}
+
+-- 
+2.44.0.rc0.258.g7320e95886-goog
+

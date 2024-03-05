@@ -163,6 +163,20 @@ impl<'a, T: ForeignOwnable> Drop for Reservation<'a, T> {
 /// let foo = Arc::try_new(Foo { a : 3, b: 4 }).expect("Unable to allocate Foo");
 /// let index = arr.alloc(foo).expect("Error allocating Index");
 ///
+/// for (index, value) in arr.iter() {
+///     if value.a == 1 {
+///         assert_eq!(index, 1);
+///         assert_eq!(value.b, 2);
+///     } else {
+///         assert_eq!(index, 2);
+///         assert_eq!(value.a, 3);
+///         assert_eq!(value.b, 4);
+///     }
+/// }
+///
+/// let sum_a: u32 = arr.values().map(|v| v.a).sum();
+/// assert_eq!(sum_a, 4);
+///
 /// if let Some(removed_data) = arr.remove(index) {
 ///     assert_eq!(removed_data.a, 3);
 ///     assert_eq!(removed_data.b, 4);
@@ -272,6 +286,22 @@ impl<T: ForeignOwnable> XArray<T> {
             // the array are pointers obtained by calling `T::into_foreign`.
             Some(unsafe { T::from_foreign(p) })
         }
+    }
+
+    /// Returns an iterator over the xarray's indices and values.
+    pub fn iter(&self) -> XArrayIterator<'_, T>
+    where
+        for<'b> T::Borrowed<'b>: Into<T>,
+    {
+        XArrayIterator::new(&self)
+    }
+
+    /// Returns an iterator over the xarray's values.
+    pub fn values(&self) -> impl Iterator<Item = T> + '_
+    where
+        for<'b> T::Borrowed<'b>: Into<T>,
+    {
+        self.iter().map(|(_, v)| v)
     }
 
     /// Allocates a new index in the array, optionally storing a new value into it, with
@@ -388,6 +418,62 @@ impl<T: ForeignOwnable> PinnedDrop for XArray<T> {
         unsafe {
             bindings::xa_destroy(self.xa.get());
         }
+    }
+}
+
+/// An iterator over the nodes of a [`XArray`].
+///
+/// Instances are created by calling [`XArray::iter`].
+pub struct XArrayIterator<'a, T: ForeignOwnable> {
+    arr: &'a XArray<T>,
+    index: Option<c_ulong>,
+}
+
+impl<'a, T: ForeignOwnable> XArrayIterator<'a, T> {
+    fn new(arr: &'a XArray<T>) -> Self {
+        Self { arr, index: None }
+    }
+}
+
+impl<'a, T: ForeignOwnable> Iterator for XArrayIterator<'a, T>
+where
+    for<'b> T::Borrowed<'b>: Into<T>,
+{
+    type Item = (usize, T);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // SAFETY: `self.arr.xa` is always valid by the type invariant.
+        unsafe { bindings::xa_lock(self.arr.xa.get()) };
+
+        // SAFETY: `self.arr.xa` is always valid by the type invariant.
+        let guard = ScopeGuard::new(|| unsafe { bindings::xa_unlock(self.arr.xa.get()) });
+
+        let mut index = self.index.unwrap_or(0);
+        let p = unsafe {
+            if self.index.is_none() {
+                bindings::xa_find(
+                    self.arr.xa.get(),
+                    &mut index,
+                    core::ffi::c_ulong::MAX,
+                    bindings::XA_PRESENT,
+                )
+            } else {
+                bindings::xa_find_after(
+                    self.arr.xa.get(),
+                    &mut index,
+                    core::ffi::c_ulong::MAX,
+                    bindings::XA_PRESENT,
+                )
+            }
+        };
+
+        let p = NonNull::new(p.cast::<T>())?;
+        guard.dismiss();
+
+        let t = Guard(p, self.arr).borrow().into();
+        self.index = Some(index);
+
+        Some((index as usize, t))
     }
 }
 

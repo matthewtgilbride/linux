@@ -194,6 +194,12 @@ int rust_helper_xa_err(void *entry)
 }
 EXPORT_SYMBOL_GPL(rust_helper_xa_err);
 
+int rust_helper_xa_insert(struct xarray *xa, u32 id, void *entry, gfp_t gfp)
+{
+	return xa_insert(xa, id, entry, gfp);
+}
+EXPORT_SYMBOL_GPL(rust_helper_xa_insert);
+
 /*
  * `bindgen` binds the C `size_t` type as the Rust `usize` type, so we can
  * use it in contexts where Rust expects a `usize` like slice (array) indices.

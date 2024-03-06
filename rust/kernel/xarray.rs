@@ -163,19 +163,30 @@ impl<'a, T: ForeignOwnable> Drop for Reservation<'a, T> {
 /// let foo = Arc::try_new(Foo { a : 3, b: 4 }).expect("Unable to allocate Foo");
 /// let index = arr.alloc(foo).expect("Error allocating Index");
 ///
+/// let foo = Arc::try_new(Foo { a: 5, b: 6 }).expect("Unable to allocate Foo");
+/// let should_fail = arr.insert(index, foo);
+/// assert!(should_fail.is_err());
+///
+/// let mut max_index = 0;
 /// for (index, value) in arr.iter() {
 ///     if value.a == 1 {
-///         assert_eq!(index, 1);
 ///         assert_eq!(value.b, 2);
 ///     } else {
-///         assert_eq!(index, 2);
 ///         assert_eq!(value.a, 3);
 ///         assert_eq!(value.b, 4);
 ///     }
+///
+///     if index > max_index {
+///         max_index = index;
+///     }
 /// }
 ///
+/// let foo = Arc::try_new(Foo { a: 5, b: 6 }).expect("Unable to allocate Foo");
+/// let should_succeed = arr.insert(max_index + 1, foo);
+/// assert!(should_succeed.is_ok());
+///
 /// let sum_a: u32 = arr.values().map(|v| v.a).sum();
-/// assert_eq!(sum_a, 4);
+/// assert_eq!(sum_a, 9);
 ///
 /// if let Some(removed_data) = arr.remove(index) {
 ///     assert_eq!(removed_data.a, 3);
@@ -245,6 +256,33 @@ impl<T: ForeignOwnable> XArray<T> {
     pub fn set(&self, index: usize, value: T) -> Result {
         self.replace(index, value)?;
         Ok(())
+    }
+
+    /// Inserts new value if and only if there is no entry at the given index.
+    pub fn insert(&self, index: usize, value: T) -> Result {
+        let index: u32 = index.try_into()?;
+        let new = value.into_foreign();
+
+        build_assert!(T::FOREIGN_ALIGN >= 4);
+
+        // SAFETY: `new` just came from into_foreign(), and we dismiss this guard if
+        // the xa_store operation succeeds and takes ownership of the pointer.
+        let guard = ScopeGuard::new(|| unsafe {
+            drop(T::from_foreign(new));
+        });
+
+        // SAFETY: `self.xa` is always valid by the type invariant, and we are storing
+        // a `T::into_foreign()` result which upholds the later invariants.
+        let ret = unsafe {
+            bindings::xa_insert(self.xa.get(), index, new.cast_mut(), bindings::GFP_KERNEL)
+        };
+
+        if ret < 0 {
+            Err(Error::from_errno(ret))
+        } else {
+            guard.dismiss();
+            Ok(())
+        }
     }
 
     /// Looks up and returns a reference to an entry in the array, returning a `Guard` if it
